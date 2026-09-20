@@ -1,0 +1,23 @@
+# Build artifacts
+build/
+**/build/
+
+# Model files (large binaries, download separately)
+models/
+**/models/*.onnx
+**/models/*.gguf
+
+# Logs
+*.log
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Config secrets
+configs/*.local.yaml

@@ -1,0 +1,39 @@
+# configs/policy.yaml
+# 路由策略配置
+
+# ===== LLM 路由 =====
+llm:
+  # local: 仅本地 llama.cpp
+  # remote: 仅远程 API
+  # auto: 本地优先，失败后回退远程
+  mode: local
+  remote_endpoint: ""          # 如 http://localhost:8080/v1/chat/completions
+  remote_model: qwen3-8b
+
+# ===== 搜索路由 =====
+search:
+  # local-first: 本地 SearXNG 优先
+  # online-only: 仅用在线服务
+  mode: local-first
+
+  # 各 Provider 开关
+  providers:
+    searxng: true              # 本地 SearXNG
+    tavily: false             # 在线 Tavily
+    brave: false              # 在线 Brave
+    exa: false                # 在线 Exa
+
+# ===== 隐私策略 =====
+privacy:
+  # 敏感话题强制本地
+  sensitive_topics:
+    - "密码"
+    - "银行"
+    - "身份证"
+    - "信用卡"
+
+  # 敏感记忆禁止上传
+  memory_sensitivity_threshold: 1
+
+  # 是否允许任何形式的网络请求
+  allow_external_requests: true

@@ -1,0 +1,44 @@
+# configs/agent.yaml
+# Voice Agent 主配置文件
+
+# ===== 音频配置 =====
+audio:
+  device: 0                    # 音频设备索引（0 = 默认）
+  sample_rate: 48000           # 设备采样率（优先 48k）
+  channels: 1                   # 单声道
+  buffer_ms: 10                 # 回调帧长（毫秒）
+
+# ===== VAD 配置 =====
+vad:
+  threshold: 0.5               # 检测阈值（嘈杂环境 0.6-0.7）
+  min_speech_ms: 220           # 最小语音时长
+  min_silence_ms: 300          # 最小静音时长
+
+# ===== 打断配置 =====
+barge_in:
+  min_ms: 160                  # 最小打断时长
+  backchannel_max_ms: 600      # 附和词最大时长
+  coherence_max: 0.6          # AEC 相干性阈值
+  fade_out_ms: 40              # 淡出时长
+
+# ===== EOU（End of Utterance）配置 =====
+eou:
+  fast_ms: 350                 # 快速判定（触发语义判定）
+  force_ms: 900                # 强制判定（兜底）
+  max_utterance_ms: 20000      # 最大说话时长
+
+# ===== 模型路径（相对于项目根目录）=====
+vad_model: models/ten-vad.onnx
+asr_model: models/sensevoice
+tts_model: models/kokoro
+llm_model: models/qwen3-4b-q4_k_m.gguf
+
+# ===== 搜索配置 =====
+search:
+  searxng_url: http://localhost:8080
+  tavily_key: ""               # 可选
+  brave_key: ""                # 可选
+
+# ===== 日志配置 =====
+log_level: info               # trace, debug, info, warn, error
+log_file: logs/voice-agent.log
