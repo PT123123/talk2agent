@@ -5,6 +5,7 @@
 
 #include "echo_cancellation.hpp"
 #include "util/log.hpp"
+#include <algorithm>
 #include <cstring>
 #include <cmath>
 #include <vector>

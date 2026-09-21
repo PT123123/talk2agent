@@ -23,6 +23,8 @@ struct DeviceInfo {
     std::string name;
     bool is_default = false;
     int id = -1;
+    // miniaudio 设备 ID 原始字节（供 ma_device_init 的 pDeviceID 使用；空 = 默认设备）
+    std::vector<unsigned char> id_bytes;
 };
 
 class AudioDeviceManager {

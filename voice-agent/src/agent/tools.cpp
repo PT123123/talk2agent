@@ -49,6 +49,56 @@ std::string format_search_results(const std::vector<SearchHit>& hits, int topk) 
 
 }  // namespace
 
+// ========== 工具意图门控 ==========
+
+namespace {
+bool contains_any(const std::string& s, std::initializer_list<const char*> keys) {
+    for (const char* k : keys) {
+        if (s.find(k) != std::string::npos) return true;
+    }
+    return false;
+}
+}
+
+std::vector<std::string> detect_tool_intent(const std::string& user_text) {
+    std::vector<std::string> enabled;
+
+    // 联网搜索：搜/查/最新/新闻/天气等
+    if (contains_any(user_text, {
+            "搜索", "搜一下", "搜一搜", "帮我搜", "查一下", "查一查", "帮我查",
+            "查找", "查询", "百度", "谷歌", "必应", "浏览器",
+            "最新", "新闻", "资讯", "热点", "天气", "气温", "降水",
+            "汇率", "股价", "股票", "大盘", "比分", "赛程", "赛况",
+            "票价", "价格", "报价", "下载地址", "教程", "百科",
+            "谁知道", "了解一下", "what", "search", "google",
+        })) {
+        enabled.push_back("web_search");
+    }
+
+    // 记忆：记住/回忆/上次/我说过 等
+    if (contains_any(user_text, {
+            "记住", "记得", "记忆", "回忆", "回想", "别忘了", "别忘",
+            "上次", "之前", "以前", "我上次", "我说过", "我讲过",
+            "我告诉过", "我提到过", "我名字", "我叫", "我的名字",
+            "我喜欢", "我不喜欢", "我讨厌", "我爱", "我住",
+            "我的生日", "我的习惯", "我的偏好", "我常用",
+            "remember", "memory",
+        })) {
+        enabled.push_back("memory_save");
+        enabled.push_back("memory_query");
+    }
+
+    // 时间：现在几点/今天日期
+    if (contains_any(user_text, {
+            "现在几", "几点", "几点了", "现在时间", "当前时间",
+            "日期", "几号", "今天周", "今天星期", "what time", "time",
+        })) {
+        enabled.push_back("get_time");
+    }
+
+    return enabled;
+}
+
 // ========== 注册内置工具 ==========
 
 void register_builtin_tools(ToolRegistry& registry, const ToolKit& kit) {

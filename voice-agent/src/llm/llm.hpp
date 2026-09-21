@@ -54,8 +54,18 @@ public:
     // 是否正在生成
     bool is_generating() const { return generating_; }
 
+    // 是否已真正加载 GGUF 模型（false 表示回退到了 Mock 占位）
+    bool real_backend() const;
+
+    // 生效推理后端标签："Vulkan GPU" / "CPU" / "Mock"
+    std::string provider_label() const;
+
     // 获取配置
     const LLMConfig& config() const { return config_; }
+
+    // 最近一次生成/流式生成的耗时度量（毫秒，供调试面板轮询）
+    double last_first_token_ms() const { return last_first_token_ms_; }
+    double last_generate_ms() const { return last_generate_ms_; }
 
 private:
     struct Impl;
@@ -63,6 +73,8 @@ private:
     LLMConfig config_;
     std::atomic<bool> generating_{false};
     std::shared_ptr<CancelToken> cancel_token_;
+    std::atomic<double> last_first_token_ms_{0.0};
+    std::atomic<double> last_generate_ms_{0.0};
 };
 
 // 创建 LLM 实例

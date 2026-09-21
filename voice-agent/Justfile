@@ -1,0 +1,49 @@
+# voice-agent 任务配方（Windows / MSVC + Ninja + Qt6）
+set shell := ["powershell.exe", "-NoLogo", "-NoProfile", "-Command"]
+
+# 常量
+vcvars := "C:/Program Files/Microsoft Visual Studio/2022/Community/VC/Auxiliary/Build/vcvars64.bat"
+qt     := "C:/Qt/6.8.3/msvc2022_64"
+bd     := "build-msvc"
+
+# 默认：列出可用命令
+default:
+    @just --list
+
+# 配置 CMake 构建（MSVC 环境 + Ninja + Qt6 + Vulkan GPU）
+configure:
+    $vsdk = Get-ChildItem "C:\VulkanSDK" -Directory -ErrorAction SilentlyContinue | Sort-Object Name -Descending | Select-Object -First 1; if ($vsdk) { $env:VULKAN_SDK = $vsdk.FullName; Write-Host "VULKAN_SDK=$($vsdk.FullName)" }; cmd /c 'call "{{vcvars}}" && cmake -S . -B {{bd}} -G Ninja -DCMAKE_PREFIX_PATH={{qt}} -DENABLE_VULKAN=ON'
+
+# 构建主程序 + 测试
+build: configure
+    cmd /c 'call "{{vcvars}}" && cmake --build {{bd}} -j'
+
+# 构建并运行 GUI（自动编译 + 配置 Qt DLL 路径）
+run: configure
+    cmd /c 'call "{{vcvars}}" && cmake --build {{bd}} --target voice-agent -j'
+    $env:PATH = "{{qt}}\bin;$env:PATH"
+    Start-Process ".\{{bd}}\voice-agent.exe"
+
+# 运行测试集（ctest）
+test: build
+    cmd /c 'call "{{vcvars}}" && ctest --test-dir {{bd}} --output-on-failure'
+
+# 运行指定测试名（单个）
+test-single NAME:
+    cmd /c 'call "{{vcvars}}" && {{bd}}\tests\{{NAME}}.exe'
+
+# 部署 Qt DLL 到可执行目录（windeployqt）
+deploy: build
+    cmd /c 'call "{{vcvars}}" && "{{qt}}\bin\windeployqt.exe" --no-translations "{{bd}}\voice-agent.exe"'
+
+# 清空构建产物
+clean:
+    cmd /c 'call "{{vcvars}}" && cmake --build {{bd}} --target clean -j'
+
+# 彻底删除构建目录（重新全量构建）
+purge:
+    Remove-Item -Recurse -Force {{bd}} -ErrorAction SilentlyContinue
+
+# 下载音频依赖库
+deps:
+    & .\scripts\download_audio_libs.ps1

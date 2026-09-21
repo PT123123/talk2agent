@@ -2,6 +2,7 @@
 #include "audio_pipeline.hpp"
 #include "audio_device.hpp"
 #include "util/log.hpp"
+#include <cmath>
 
 namespace voice_agent {
 
@@ -31,6 +32,17 @@ bool AudioPipeline::initialize(const AudioConfig& config) {
     
     // 设置输入回调
     impl_->input_device.set_input_callback([this](const int16_t* data, size_t frames) {
+        // 计算输入电平（dBFS），供调试界面轮询
+        if (data && frames > 0) {
+            float sum = 0.0f;
+            for (size_t i = 0; i < frames; ++i) {
+                float s = static_cast<float>(data[i]) / 32768.0f;
+                sum += s * s;
+            }
+            float rms = std::sqrt(sum / static_cast<float>(frames));
+            last_input_level_db_.store(rms <= 1e-6f ? -96.0f
+                                                    : 20.0f * std::log10(rms));
+        }
         if (impl_->input_callback) {
             impl_->input_callback(data, frames);
         }

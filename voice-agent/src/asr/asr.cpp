@@ -1,8 +1,12 @@
 // src/asr/asr.cpp
 #include "asr.hpp"
+#include "asr/sherpa_asr.hpp"
+#include "asr/whisper_onnx.hpp"
 #include "util/log.hpp"
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <filesystem>
 
 namespace voice_agent {
 
@@ -12,9 +16,55 @@ struct ASR::Impl {
     std::vector<float> audio_buffer;
     size_t samples_per_chunk = 0;
 
-    Impl() = default;
+    // 真实模型后端（sherpa-onnx 中文 / Whisper ONNX）。为空则回退到流式 Mock。
+    std::unique_ptr<SherpaAsr> sherpa;
+    std::string sherpa_name;
+    std::unique_ptr<WhisperOnnx> whisper;
+    bool whisper_mode = false;
+
+    // 是否在 model_path 指定目录内发现 Whisper 模型文件
+    static bool is_whisper_dir(const std::string& model_path) {
+        if (model_path.empty()) return false;
+        std::error_code ec;
+        return std::filesystem::exists(model_path + "/onnx/encoder_model.onnx", ec);
+    }
+
+    // sherpa-onnx 中文模型目录：model.onnx / model.int8.onnx + tokens.txt
+    static bool is_sherpa_dir(const std::string& model_path) {
+        if (model_path.empty()) return false;
+        std::error_code ec;
+        return (std::filesystem::exists(model_path + "/model.onnx", ec) ||
+                std::filesystem::exists(model_path + "/model.int8.onnx", ec)) &&
+               std::filesystem::exists(model_path + "/tokens.txt", ec);
+    }
 
     bool load_model(const ASRConfig& config) {
+        // 1) sherpa-onnx Paraformer-zh / SenseVoice（中文优先，新默认）
+        if (is_sherpa_dir(config.model_path)) {
+            auto s = std::make_unique<SherpaAsr>();
+            if (s->load(config.model_path, config.num_threads, config.provider)) {
+                sherpa = std::move(s);
+                sherpa_name = sherpa->model_name();
+                LOG_INFO("ASR: real sherpa-onnx backend loaded ({}) from {}",
+                         sherpa_name, config.model_path);
+                return true;
+            }
+            LOG_WARN("ASR: sherpa-onnx load failed ({}), falling back to whisper/mock",
+                     s->last_error());
+            // 继续尝试 Whisper
+        }
+        // 2) Whisper ONNX（旧默认，保留）
+        if (is_whisper_dir(config.model_path)) {
+            auto w = std::make_unique<WhisperOnnx>();
+            if (w->load(config.model_path)) {
+                whisper = std::move(w);
+                whisper_mode = true;
+                LOG_INFO("ASR: real Whisper backend loaded from {}", config.model_path);
+                return true;
+            }
+            LOG_WARN("ASR: Whisper load failed ({}), falling back to mock", w->last_error());
+            // 加载失败落到 mock 流式
+        }
         LOG_INFO("MockASR: initialized (model={})", config.model_path);
         samples_per_chunk = 16000;  // 1 second @ 16kHz
         return true;
@@ -85,6 +135,73 @@ void ASR::process_float(const float* pcm, size_t frames) {
         return;
     }
     impl_->process_audio(pcm, frames);
+}
+
+std::string ASR::transcribe_segment(const int16_t* pcm, size_t frames) {
+    if (!active_ || !impl_ || !pcm || frames == 0) return {};
+
+#ifdef USE_SHERPAONNX
+    if (impl_->sherpa) {
+        const auto t0 = std::chrono::steady_clock::now();
+        std::string text = impl_->sherpa->transcribe(pcm, frames);
+        last_inference_ms.store(
+            std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - t0)
+                .count());
+        if (!text.empty() && impl_->callback) {
+            ASRResult result;
+            result.text = text;
+            result.confidence = 0.95f;
+            result.is_final = true;
+            result.timestamp_ms = 0;
+            impl_->callback(result);
+        }
+        return text;
+    }
+#endif
+#ifdef USE_ONNXRUNTIME
+    if (impl_->whisper) {
+        const auto t0 = std::chrono::steady_clock::now();
+        std::string text = impl_->whisper->transcribe(pcm, frames);
+        last_inference_ms.store(
+            std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - t0)
+                .count());
+        if (!text.empty() && impl_->callback) {
+            ASRResult result;
+            result.text = text;
+            result.confidence = 0.9f;
+            result.is_final = true;
+            result.timestamp_ms = 0;
+            impl_->callback(result);
+        }
+        return text;
+    }
+#endif
+    // Mock/流式模式：把整段交给识别器
+    std::vector<float> f(frames);
+    for (size_t i = 0; i < frames; ++i) f[i] = pcm[i] / 32768.0f;
+    const auto t0 = std::chrono::steady_clock::now();
+    impl_->recognize(f.data(), f.size());
+    last_inference_ms.store(
+        std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - t0)
+            .count());
+    return {};
+}
+
+bool ASR::uses_real_backend() const {
+    return impl_ != nullptr && (impl_->sherpa != nullptr || impl_->whisper != nullptr);
+}
+
+std::string ASR::provider_label() const {
+#ifdef USE_SHERPAONNX
+    if (impl_ && impl_->sherpa) return impl_->sherpa->provider_label();
+#endif
+#ifdef USE_ONNXRUNTIME
+    if (impl_ && impl_->whisper) return "CPU";  // Whisper ONNX 为纯 CPU 推理
+#endif
+    return "Mock";
 }
 
 void ASR::set_callback(ASRCallback callback) {
