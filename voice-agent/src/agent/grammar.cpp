@@ -192,8 +192,9 @@ std::string validate_tool_args_json(const std::string& args_json, const std::str
     }
     if (!j.is_object()) return "arguments must be a JSON object";
 
-    auto it = required_fields().find(name);
-    if (it == required_fields().end()) return "";  // 未知工具不额外约束
+    auto rules = required_fields();   // 持有副本，保证 iterator 生命周期
+    auto it = rules.find(name);
+    if (it == rules.end()) return "";  // 未知工具不额外约束
 
     for (auto& rule : it->second) {
         if (j.contains(rule.key)) {

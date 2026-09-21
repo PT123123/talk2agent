@@ -28,10 +28,10 @@ eou:
   max_utterance_ms: 20000      # 最大说话时长
 
 # ===== 模型路径（相对于项目根目录）=====
-vad_model: models/ten-vad.onnx
-asr_model: models/sensevoice
-tts_model: models/kokoro
-llm_model: models/qwen3-4b-q4_k_m.gguf
+vad_model: models/vad/silero_vad.onnx
+asr_model: models/asr/paraformer-zh
+tts_model: models/tts/kokoro-multi-lang-v1_0
+llm_model: models/llm/qwen2.5-1.5b-instruct-q4_k_m.gguf
 
 # ===== 搜索配置 =====
 search:

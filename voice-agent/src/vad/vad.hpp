@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <string>
 #include <vector>
 #include <atomic>
 
@@ -24,6 +25,7 @@ struct VADConfig {
     int min_silence_duration_ms = 500; // 最小静音持续时间（触发 speech end）
     float speech_threshold = 0.5f;    // 语音检测阈值
     bool enable_silero_refine = true;  // 启用 silero 复核
+    bool use_gpu = true;           // 优先用 DirectML GPU（运行时支持时），否则 CPU
 };
 
 // VAD 回调
@@ -57,6 +59,12 @@ public:
     // 获取当前状态
     bool is_speaking() const { return is_speaking_; }
     float get_speech_probability() const { return speech_prob_; }
+
+    // 生效推理后端标签："DirectML GPU" / "CPU"
+    std::string provider_label() const;
+
+    // 最近一次单帧推理耗时（毫秒，供调试面板轮询）
+    std::atomic<double> last_inference_ms{0.0};
 
 private:
     struct Impl;

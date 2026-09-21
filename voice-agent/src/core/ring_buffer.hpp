@@ -53,6 +53,9 @@ public:
 
         // 允许覆盖：最多写入 N 个样本
         size_t to_write = std::min(count, N);
+        // 当一次写入超过容量时，保留最新的 N 个（丢弃最旧的 count-N），
+        // 符合"覆盖最旧数据、保留最新"的语义（音频场景消费端落后时避免回放旧数据）
+        const size_t src_skip = (count > N) ? (count - N) : 0;
 
         // 计算实际可无覆盖写入的数量（保留一个样本的"满"检测空间）
         // available = N - used - 1（如果不想覆盖）
@@ -62,9 +65,10 @@ public:
 
         // 写数据到 buffer
         T* dst = buffer_->data() + (head & MASK);
-        std::memcpy(dst, data, first_part * sizeof(T));
+        std::memcpy(dst, data + src_skip, first_part * sizeof(T));
         if (second_part > 0) {
-            std::memcpy(buffer_->data(), data + first_part, second_part * sizeof(T));
+            std::memcpy(buffer_->data(), data + src_skip + first_part,
+                        second_part * sizeof(T));
         }
 
         // 内存屏障：确保数据写完后再更新 head

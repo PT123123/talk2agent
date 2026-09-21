@@ -66,6 +66,8 @@ std::vector<DeviceInfo> AudioDeviceManager::list_input_devices() const {
         info.name = capture_infos[i].name;
         info.id = static_cast<int>(i);
         info.is_default = (i == 0);
+        const auto* idp = reinterpret_cast<const unsigned char*>(&capture_infos[i].id);
+        info.id_bytes.assign(idp, idp + sizeof(capture_infos[i].id));
         devices.push_back(info);
     }
 
@@ -203,19 +205,50 @@ AudioDevice::~AudioDevice() {
 }
 
 bool AudioDevice::init_as_input(const AudioConfig& config, const std::string& device_name) {
-    (void)device_name;  // 暂未实现设备选择
     config_ = config;
-    
+
+    // 按设备名解析 miniaudio 设备 ID（name 为空 → 默认设备）。
+    // ma_device_id 是 POD（16 字节 union），可安全拷贝；设备枚举用独立临时 context，
+    // 拿到 ID 副本后即可释放。
+    std::vector<unsigned char> id_bytes;
+    if (!device_name.empty()) {
+        ma_context ctx;
+        if (ma_context_init(nullptr, 0, nullptr, &ctx) == MA_SUCCESS) {
+            ma_device_info* playback_infos = nullptr;
+            ma_device_info* capture_infos = nullptr;
+            ma_uint32 playback_count = 0;
+            ma_uint32 capture_count = 0;
+            if (ma_context_get_devices(&ctx, &playback_infos, &playback_count,
+                                       &capture_infos, &capture_count) == MA_SUCCESS) {
+                for (ma_uint32 i = 0; i < capture_count; ++i) {
+                    if (device_name == capture_infos[i].name) {
+                        const auto* idp = reinterpret_cast<const unsigned char*>(&capture_infos[i].id);
+                        id_bytes.assign(idp, idp + sizeof(capture_infos[i].id));
+                        LOG_INFO("Input device selected by name: '{}'", device_name);
+                        break;
+                    }
+                }
+            }
+            ma_context_uninit(&ctx);
+        }
+        if (id_bytes.empty()) {
+            LOG_WARN("Input device '{}' not found, falling back to default", device_name);
+        }
+    }
+
     ma_device_config dev_config = ma_device_config_init(ma_device_type_capture);
     dev_config.sampleRate = static_cast<ma_uint32>(config.sample_rate);
     dev_config.periodSizeInFrames = static_cast<ma_uint32>(config.frames_per_buffer);
     dev_config.dataCallback = input_callback_wrapper;
     dev_config.pUserData = impl_.get();
-    
+    if (!id_bytes.empty()) {
+        dev_config.capture.pDeviceID = reinterpret_cast<const ma_device_id*>(id_bytes.data());
+    }
+
     // 设置采样格式和声道
     dev_config.capture.format = ma_format_s16;
     dev_config.capture.channels = static_cast<ma_uint32>(config.channels);
-    
+
     ma_result result = ma_device_init(nullptr, &dev_config, &impl_->device);
     if (result != MA_SUCCESS) {
         LOG_ERROR("Failed to initialize input device: {}", static_cast<int>(result));

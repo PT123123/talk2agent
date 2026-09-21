@@ -2,8 +2,17 @@
 #include "orchestrator.hpp"
 #include "util/log.hpp"
 #include <cstring>
+#include <chrono>
 
 namespace voice_agent {
+
+namespace {
+inline double now_ms() {
+    return std::chrono::duration<double, std::milli>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+}  // namespace
 
 // ========== 构造函数 / 析构函数 ==========
 
@@ -87,17 +96,28 @@ void Orchestrator::start() {
         });
     }
 
-    // 注册 AudioPipeline 输入回调（采集数据流向 VAD）
+    // 注册 AudioPipeline 输入回调（采集数据流向 VAD，同时缓冲语音段）
     if (audio_pipeline_) {
         audio_pipeline_->set_input_callback([this](const int16_t* data, size_t frames) {
-            if (vad_) {
-                // 下采样 48kHz → 16kHz
-                std::vector<int16_t> pcm_16k(frames / 3);
-                for (size_t i = 0; i < pcm_16k.size(); ++i) {
-                    int32_t sum = 0;
-                    for (int j = 0; j < 3; ++j) sum += data[i * 3 + j];
-                    pcm_16k[i] = static_cast<int16_t>(sum / 3);
+            // 下采样 48kHz → 16kHz
+            std::vector<int16_t> pcm_16k(frames / 3);
+            for (size_t i = 0; i < pcm_16k.size(); ++i) {
+                int32_t sum = 0;
+                for (int j = 0; j < 3; ++j) sum += data[i * 3 + j];
+                pcm_16k[i] = static_cast<int16_t>(sum / 3);
+            }
+
+            // 采集进行中：累积当前语音段（SpeechStart → SpeechEnd）
+            if (capturing_.load()) {
+                speech_buffer_.insert(speech_buffer_.end(),
+                                      pcm_16k.begin(), pcm_16k.end());
+                if (speech_buffer_.size() > 16000u * 30u) {  // 30s 上限
+                    speech_buffer_.erase(speech_buffer_.begin(),
+                                         speech_buffer_.end() - 16000u * 30u);
                 }
+            }
+
+            if (vad_enabled_.load() && vad_) {
                 vad_->process(pcm_16k.data(), pcm_16k.size());
             }
         });
@@ -143,6 +163,8 @@ void Orchestrator::stop() {
         tts_->stop();
     }
 
+    capturing_ = false;
+    speech_buffer_.clear();
     eou_detector_.reset();
     smart_turn_.reset();
     audio_router_.stop_playback();
@@ -155,8 +177,14 @@ void Orchestrator::stop() {
 void Orchestrator::on_vad_speech_start(uint64_t timestamp_us) {
     if (!running_.load()) return;
 
+    user_speech_start_us_ = timestamp_us;
+
     State s = state_.load();
     LOG_DEBUG("VAD speech start in state {}", state_to_string(s));
+
+    // 开始累积语音段
+    capturing_ = true;
+    speech_buffer_.clear();
 
     if (s == State::Idle || s == State::Listening) {
         enter_listening_();
@@ -178,8 +206,89 @@ void Orchestrator::on_vad_speech_start(uint64_t timestamp_us) {
 
 void Orchestrator::on_vad_speech_end(uint64_t timestamp_us) {
     if (!running_.load()) return;
+
+    // 语音段结束：停止累积，把整段音频交给 ASR（Whisper 整段转写）
+    capturing_ = false;
+    if (user_speech_start_us_ != 0) {
+        const double speech_ms = (timestamp_us - user_speech_start_us_) / 1000.0;
+        if (trace_cb_) trace_cb_("speech", speech_ms);
+        user_speech_start_us_ = 0;
+    }
+
     eou_detector_.on_vad_end(timestamp_us);
     smart_turn_.user_speech_end(timestamp_us);
+
+    std::vector<int16_t> seg;
+    seg.swap(speech_buffer_);
+    submit_segment_(std::move(seg));
+}
+
+// 手动采集开始（VAD 关闭 / ASR 接管模式）：对讲按下时调用
+void Orchestrator::begin_capture() {
+    if (!running_.load()) return;
+
+    capturing_ = true;
+    speech_buffer_.clear();
+    capture_start_us_ = static_cast<uint64_t>(
+        std::chrono::steady_clock::now().time_since_epoch().count() / 1000);
+
+    State s = state_.load();
+    if (s == State::Idle || s == State::Listening) enter_listening_();
+}
+
+// 手动采集结束（VAD 关闭 / ASR 接管模式）：对讲松开时调用，整段提交转写
+void Orchestrator::end_capture() {
+    if (!running_.load()) return;
+
+    capturing_ = false;
+    if (capture_start_us_ != 0) {
+        const uint64_t now = static_cast<uint64_t>(
+            std::chrono::steady_clock::now().time_since_epoch().count() / 1000);
+        const double speech_ms = (now - capture_start_us_) / 1000.0;
+        if (trace_cb_) trace_cb_("speech", speech_ms);
+        capture_start_us_ = 0;
+    }
+
+    std::vector<int16_t> seg;
+    seg.swap(speech_buffer_);
+    submit_segment_(std::move(seg));
+}
+
+void Orchestrator::submit_segment_(std::vector<int16_t> seg) {
+    if (turn_busy_.exchange(true)) {
+        // 上一轮仍在处理（LLM 生成中），丢弃本次语音段，避免线程堆积
+        speech_buffer_.clear();
+        LOG_WARN("Turn processing busy - dropping utterance");
+        return;
+    }
+
+    // 转写 + Agent 轮次放到独立线程，避免阻塞音频回调线程
+    // （ASR 回调会把转写文本追加进 accumulated_text_，此处随后统一取出）
+    std::thread([this, seg = std::move(seg)]() {
+        std::string text;
+        if (asr_ && !seg.empty()) {
+            const double t0 = now_ms();
+            text = asr_->transcribe_segment(seg.data(), seg.size());
+            if (trace_cb_) trace_cb_("asr", now_ms() - t0);
+            LOG_INFO("speech_end: ASR transcribed {} chars", text.size());
+        }
+        {
+            std::lock_guard<std::mutex> lock(text_mutex_);
+            if (text.empty()) text = accumulated_text_;
+            accumulated_text_.clear();   // 用户文本就此提交，后续由 LLM 流式回填
+        }
+        if (!running_.load()) {
+            turn_busy_ = false;
+            return;
+        }
+        if (user_text_cb_ && !text.empty()) user_text_cb_(text);
+        if (text.empty()) {
+            enter_idle_();
+        } else {
+            enter_thinking_(text);
+        }
+        turn_busy_ = false;
+    }).detach();
 }
 
 void Orchestrator::on_barge_in_detected() {
@@ -207,6 +316,9 @@ void Orchestrator::on_barge_in_detected() {
 void Orchestrator::set_state_(State new_state) {
     State old_state = state_.exchange(new_state);
     LOG_INFO("State: {} → {}", state_to_string(old_state), state_to_string(new_state));
+    if (state_cb_) {
+        state_cb_(std::string(state_to_string(new_state)));
+    }
     global_event_bus().publish(Event{EventType::StateChanged, 0,
         std::string(state_to_string(new_state)), {}, ""});
 }
@@ -235,6 +347,8 @@ void Orchestrator::enter_thinking_(const std::string& text) {
 
     // 生成新的 session token
     session_token_ = std::make_shared<CancelToken>();
+    tts_accum_ms_.store(0.0);
+    tts_accum_active_ = false;
 
     // ---- /memory 命令：直接执行并播报，不走 LLM ----
     if (memory_ && is_memory_command(text)) {
@@ -250,6 +364,14 @@ void Orchestrator::enter_thinking_(const std::string& text) {
         ToolExecutor executor(*agent_tools_);
         AgentLoop loop(*llm_, *agent_tools_, executor);
 
+        // 转发阶段计时与工具事件给上层（GUI 时间轴 / 工具区）
+        loop.set_trace([this](const std::string& stage, double ms) {
+            if (trace_cb_) trace_cb_(stage, ms);
+        });
+        loop.set_tool_report([this](const std::string& line) {
+            if (tool_cb_) tool_cb_(line);
+        });
+
         // 记忆召回注入 system prompt
         std::string sys_prompt = agent_system_prompt_;
         if (memory_ && memory_->is_open()) {
@@ -264,6 +386,8 @@ void Orchestrator::enter_thinking_(const std::string& text) {
             }
         }
         loop.set_system_prompt(sys_prompt);
+        // 工具意图门控：仅当用户明确要求（搜索/记忆/时间）时才放行对应工具
+        loop.set_enabled_tools(detect_tool_intent(text));
         loop.set_token_sink([this](const std::string& token) {
             // 复用原有流式逻辑：文本 token 累积 + 触发流式 TTS
             on_llm_token_(LLMResponse{token, false, 0});
@@ -271,10 +395,8 @@ void Orchestrator::enter_thinking_(const std::string& text) {
 
         auto res = loop.run(text, session_token_);
 
-        // 自动 ingest 用户事实
-        if (!res.cancelled && memory_ && memory_->is_open()) {
-            memory_->ingest(text, res.final_text);
-        }
+        // 注意：不再自动 ingest 用户事实。记忆写入只发生在用户明确指示时
+        // （/memory 命令，或模型在用户要求"记住…"时调用 memory_save 工具）。
 
         if (res.cancelled) {
             // 打断由 on_barge_in_detected 负责状态迁移（->Interrupting->Listening）
@@ -365,18 +487,22 @@ void Orchestrator::on_llm_token_(const LLMResponse& chunk) {
             accumulated_text_ += chunk.text;
         }
 
-        // 回调给上层
-        if (text_callback_) {
-            text_callback_(chunk.text);
+        // 回调给上层（流式增量 → 实时回复面板；不在此处触发"完整回答"，
+        // 避免每个 token 都产生一条 llmComplete 气泡）
+        if (token_cb_) {
+            token_cb_(chunk.text);
         }
 
-        // 流式触发 TTS（边生成边合成）
-        if (tts_ && state_.load() == State::Thinking) {
+        // 流式触发 TTS（边生成边合成）；开关关闭时跳过
+        if (tts_ && tts_enabled_.load() && state_.load() == State::Thinking) {
             tts_->set_cancel_token(session_token_);
+            tts_accum_active_ = true;
+            const double t0 = now_ms();
             tts_->synthesize_stream(chunk.text,
                 [this](const int16_t* audio, size_t frames, bool is_last) {
                     on_tts_chunk_(audio, frames, is_last);
                 });
+            tts_accum_ms_.store(tts_accum_ms_.load() + (now_ms() - t0));
         }
 
         // LLM 结束
@@ -396,6 +522,19 @@ void Orchestrator::on_llm_complete_() {
     }
 
     LOG_INFO("LLM generation complete: {} chars", final_text.size());
+
+    // 完整回答整段回调一次（GUI 以此在对话区落一条完整气泡 + 记录最近回复）
+    if (!final_text.empty() && text_callback_) {
+        text_callback_(final_text);
+    }
+
+    // 上报流式 TTS 累计耗时（若有）
+    if (tts_accum_active_) {
+        tts_accum_active_ = false;
+        const double t = tts_accum_ms_.load();
+        if (t > 0.0 && trace_cb_) trace_cb_("tts", t);
+        tts_accum_ms_.store(0.0);
+    }
 
     if (!final_text.empty()) {
         enter_speaking_();
@@ -427,6 +566,18 @@ std::string Orchestrator::current_text() const {
 
 void Orchestrator::set_text_callback(OrchestratorCallback cb) {
     text_callback_ = std::move(cb);
+}
+
+void Orchestrator::set_tts_enabled(bool enabled) {
+    const bool was = tts_enabled_.exchange(enabled);
+    if (was && !enabled) {
+        // 关闭播报：中止正在进行的合成与播放
+        if (tts_) tts_->stop();
+        audio_router_.stop_playback();
+        LOG_INFO("TTS playback disabled");
+    } else if (!was && enabled) {
+        LOG_INFO("TTS playback enabled");
+    }
 }
 
 // ========== Agent 工具集成（M5）==========
