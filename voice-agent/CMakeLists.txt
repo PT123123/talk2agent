@@ -36,7 +36,7 @@ endif()
 
 # ========== 编译器选项 ==========
 if(MSVC)
-    add_compile_options(/W3 /utf-8)
+    add_compile_options(/W3 /utf-8 /EHsc)
     add_compile_options(/wd4251 /wd4275)
 else()
     add_compile_options(-Wall -Wextra -Wpedantic)
@@ -349,7 +349,7 @@ if(BUILD_GUI)
         )
         add_executable(voice-agent WIN32 ${GUI_SOURCES})
         target_include_directories(voice-agent PRIVATE src ${CMAKE_SOURCE_DIR}/third_party)
-        target_link_libraries(voice-agent PRIVATE voice_agent_core Qt6::Widgets Qt6::Core Qt6::Network)
+        target_link_libraries(voice-agent PRIVATE voice_agent_core Qt6::Widgets Qt6::Core Qt6::Network dwmapi.lib)
         set_target_properties(voice-agent PROPERTIES
             AUTOMOC ON
             WIN32_EXECUTABLE TRUE

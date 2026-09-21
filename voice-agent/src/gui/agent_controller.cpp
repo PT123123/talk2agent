@@ -412,71 +412,14 @@ void AgentController::initCore_() {
         emit logLine(QStringLiteral("已注册工具：[%1]").arg(to_q(joined)));
     }
 
-    // 模型模块（当前为 mock 实现，真实模型未接入时自动回退）
+    // 模型模块：先创建 Mock 占位，SEH 防护加载真实模型；
+    // 访问违规（0xc0000005）被 __except 拦截并回退 Mock，保证进程存活。
     impl->llm = std::make_shared<LLM>();
     impl->vad = std::make_shared<VAD>();
     impl->asr = std::make_shared<ASR>();
     impl->tts = std::make_shared<TTS>();
-    try {
-        LLMConfig lc{};
-        lc.model_path = impl->cfg.llm_model;
-        lc.n_gpu_layers = kLLMGpuLayers;
-        emit loadStageChanged(++step, total, kInitStages[step - 1]);
-        {
-            auto t0 = std::chrono::steady_clock::now();
-            markModelLoading_("LLM", impl->cfg.llm_model);
-            impl->llm->initialize(lc);
-            markModelReady_("LLM",
-                std::chrono::duration<double, std::milli>(
-                    std::chrono::steady_clock::now() - t0).count());
-        }
-
-        emit loadStageChanged(++step, total, kInitStages[step - 1]);
-        {
-            auto t0 = std::chrono::steady_clock::now();
-            markModelLoading_("VAD", impl->cfg.vad_model);
-            impl->vad->initialize(VADConfig{});
-            impl->vad->set_model_path(impl->cfg.vad_model,
-                                      impl->cfg.vad_model.empty()
-                                          ? std::string()
-                                          : impl->cfg.vad_model);
-            markModelReady_("VAD",
-                std::chrono::duration<double, std::milli>(
-                    std::chrono::steady_clock::now() - t0).count());
-        }
-
-        ASRConfig ac{};
-        ac.model_path = impl->cfg.asr_model;
-        emit loadStageChanged(++step, total, kInitStages[step - 1]);
-        {
-            auto t0 = std::chrono::steady_clock::now();
-            markModelLoading_("ASR", impl->cfg.asr_model);
-            impl->asr->initialize(ac);
-            markModelReady_("ASR",
-                std::chrono::duration<double, std::milli>(
-                    std::chrono::steady_clock::now() - t0).count());
-        }
-        emit logLine(QStringLiteral("ASR后端：%1")
-                         .arg(impl->asr->uses_real_backend()
-                                  ? QStringLiteral("Whisper(真实)")
-                                  : QStringLiteral("Mock(占位)")));
-
-        TTSConfig tc = tts_config_for_dir(impl->cfg.tts_model, impl->cfg);
-        if (tc.engine.empty()) tc.engine = impl->cfg.tts_engine;  // 目录未识别 → 配置引擎
-        emit loadStageChanged(++step, total, kInitStages[step - 1]);
-        {
-            auto t0 = std::chrono::steady_clock::now();
-            markModelLoading_("TTS", impl->cfg.tts_model);
-            impl->tts->initialize(tc);
-            markModelReady_("TTS",
-                std::chrono::duration<double, std::milli>(
-                    std::chrono::steady_clock::now() - t0).count());
-        }
-        emit logLine(QStringLiteral("TTS后端：%1")
-                         .arg(to_q(impl->tts->provider_label())));
-    } catch (...) {
-        emit logLine("模型加载失败，回退 Mock 模式（界面仍可正常使用）。");
-    }
+    // initModelsWork_ 内部独立 try/catch，单模失败不影响其余四个
+    initModelsGuarded_(impl.get(), step, total);
 
     // Orchestrator 全双工状态机：真实麦克风采集 → VAD → ASR → LLM/工具 → TTS → 播放
     emit loadStageChanged(++step, total, kInitStages[step - 1]);
@@ -517,6 +460,179 @@ void AgentController::initCore_() {
                              "请在“设置”页下载或把 GGUF 放到 %1。")
                   .arg(QString::fromStdString(llmPath)));
     }
+}
+
+// ========== SEH 就地防护（拦截 0xc0000005 等硬件异常）==========
+// MSVC SEH：__try / __except；E06D 对应 C++ throw
+// C2712 约束：含 __try 的函数不得有带析构的局部对象（智能指针/容器等）。
+// 策略：Impl 以原始指针传入；__try 内只调用成员方法，不触发隐式析构链。
+
+int AgentController::initModelsGuarded_(Impl* impl, int& step, int total) {
+    __try {
+        initModelsWork_(impl);
+        return 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        emit errorLine(QStringLiteral("模型加载触发访问违规（0x%1），已回退 Mock 模式，界面保持运行。")
+                           .arg(GetExceptionCode(), 0, 16));
+        return static_cast<int>(GetExceptionCode());
+    }
+}
+
+void AgentController::initModelsWork_(Impl* impl) {
+    // 每个模块独立 try/catch：单个失败不影响其余四个
+    try {
+        emit loadStageChanged(5, 9, kInitStages[4]);   // "加载 LLM 模型"
+        auto t0 = std::chrono::steady_clock::now();
+        markModelLoading_("LLM", impl->cfg.llm_model);
+        impl->llm->initialize(LLMConfig{impl->cfg.llm_model, kLLMGpuLayers});
+        markModelReady_("LLM", std::chrono::duration<double, std::milli>(
+                                   std::chrono::steady_clock::now() - t0).count());
+    } catch (const std::exception& e) {
+        emit logLine(QStringLiteral("LLM 加载失败：%1（回退 Mock）").arg(to_q(e.what())));
+    }
+
+    try {
+        emit loadStageChanged(6, 9, kInitStages[5]);   // "加载 VAD 模型"
+        auto t0 = std::chrono::steady_clock::now();
+        markModelLoading_("VAD", impl->cfg.vad_model);
+        impl->vad->initialize(VADConfig{});
+        impl->vad->set_model_path(impl->cfg.vad_model,
+                                  impl->cfg.vad_model.empty()
+                                      ? std::string()
+                                      : impl->cfg.vad_model);
+        markModelReady_("VAD", std::chrono::duration<double, std::milli>(
+                                  std::chrono::steady_clock::now() - t0).count());
+    } catch (const std::exception& e) {
+        emit logLine(QStringLiteral("VAD 加载失败：%1（回退 Mock）").arg(to_q(e.what())));
+    }
+
+    try {
+        emit loadStageChanged(7, 9, kInitStages[6]);   // "加载 ASR 模型"
+        auto t0 = std::chrono::steady_clock::now();
+        markModelLoading_("ASR", impl->cfg.asr_model);
+        impl->asr->initialize(ASRConfig{impl->cfg.asr_model});
+        markModelReady_("ASR", std::chrono::duration<double, std::milli>(
+                                  std::chrono::steady_clock::now() - t0).count());
+        emit logLine(QStringLiteral("ASR后端：%1")
+                         .arg(impl->asr->uses_real_backend()
+                                  ? QStringLiteral("Whisper(真实)")
+                                  : QStringLiteral("Mock(占位)")));
+    } catch (const std::exception& e) {
+        emit logLine(QStringLiteral("ASR 加载失败：%1（回退 Mock）").arg(to_q(e.what())));
+    }
+
+    try {
+        emit loadStageChanged(8, 9, kInitStages[7]);   // "加载 TTS 模型"
+        TTSConfig tc = tts_config_for_dir(impl->cfg.tts_model, impl->cfg);
+        if (tc.engine.empty()) tc.engine = impl->cfg.tts_engine;
+        auto t0 = std::chrono::steady_clock::now();
+        markModelLoading_("TTS", impl->cfg.tts_model);
+        impl->tts->initialize(tc);
+        markModelReady_("TTS", std::chrono::duration<double, std::milli>(
+                                  std::chrono::steady_clock::now() - t0).count());
+        emit logLine(QStringLiteral("TTS后端：%1").arg(to_q(impl->tts->provider_label())));
+    } catch (const std::exception& e) {
+        emit logLine(QStringLiteral("TTS 加载失败：%1（回退 Mock）").arg(to_q(e.what())));
+    }
+}
+
+int AgentController::applyModelsGuarded_(Impl* impl, const ModelPaths& paths) {
+    __try {
+        applyModelsWork_(impl, paths);
+        return 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        emit errorLine(QStringLiteral("模型切换触发访问违规（0x%1），保持原有模型。")
+                           .arg(GetExceptionCode(), 0, 16));
+        return static_cast<int>(GetExceptionCode());
+    }
+}
+
+void AgentController::applyModelsWork_(Impl* impl, const ModelPaths& paths) {
+    const std::string defVad = impl->cfg.vad_model;
+    const std::string defAsr = impl->cfg.asr_model;
+    const std::string defTts = impl->cfg.tts_model;
+    const std::string defLlm = impl->cfg.llm_model;
+
+    const std::string vadPath = resolve_model(paths.vad, defVad, "models/vad");
+    const std::string asrPath = resolve_model(paths.asr, defAsr, "models/asr");
+    const std::string ttsPath = resolve_model(paths.tts, defTts, "models/tts");
+    const std::string llmPath = resolve_model(paths.llm, defLlm, "models/llm");
+
+    emit logLine(QStringLiteral("正在切换模型：VAD=%1  ASR=%2  TTS=%3  LLM=%4")
+                     .arg(to_q(vadPath), to_q(asrPath), to_q(ttsPath), to_q(llmPath)));
+
+    int step = 0;
+    const int total = kSwitchStageCount();
+
+    try {
+        emit loadStageChanged(++step, total, kSwitchStages[step - 1]);
+        auto t0 = std::chrono::steady_clock::now();
+        markModelLoading_("LLM", llmPath);
+        impl->llm->initialize(LLMConfig{llmPath, kLLMGpuLayers});
+        markModelReady_("LLM", std::chrono::duration<double, std::milli>(
+                                  std::chrono::steady_clock::now() - t0).count());
+    } catch (const std::exception& e) {
+        emit errorLine(QStringLiteral("LLM 切换失败：%1").arg(to_q(e.what())));
+    }
+
+    try {
+        emit loadStageChanged(++step, total, kSwitchStages[step - 1]);
+        auto t0 = std::chrono::steady_clock::now();
+        markModelLoading_("VAD", vadPath);
+        impl->vad->initialize(VADConfig{});
+        impl->vad->set_model_path(vadPath, vadPath);
+        markModelReady_("VAD", std::chrono::duration<double, std::milli>(
+                                  std::chrono::steady_clock::now() - t0).count());
+    } catch (const std::exception& e) {
+        emit errorLine(QStringLiteral("VAD 切换失败：%1").arg(to_q(e.what())));
+    }
+
+    try {
+        emit loadStageChanged(++step, total, kSwitchStages[step - 1]);
+        auto t0 = std::chrono::steady_clock::now();
+        markModelLoading_("ASR", asrPath);
+        impl->asr->initialize(ASRConfig{asrPath});
+        markModelReady_("ASR", std::chrono::duration<double, std::milli>(
+                                  std::chrono::steady_clock::now() - t0).count());
+        emit logLine(QStringLiteral("ASR后端：%1")
+                         .arg(impl->asr->uses_real_backend()
+                                  ? QStringLiteral("Whisper(真实)")
+                                  : QStringLiteral("Mock(占位)")));
+    } catch (const std::exception& e) {
+        emit errorLine(QStringLiteral("ASR 切换失败：%1").arg(to_q(e.what())));
+    }
+
+    try {
+        emit loadStageChanged(++step, total, kSwitchStages[step - 1]);
+        TTSConfig tc = tts_config_for_dir(ttsPath, impl->cfg);
+        if (tc.engine.empty()) tc.engine = impl->cfg.tts_engine;
+        auto t0 = std::chrono::steady_clock::now();
+        markModelLoading_("TTS", ttsPath);
+        impl->tts->initialize(tc);
+        markModelReady_("TTS", std::chrono::duration<double, std::milli>(
+                                  std::chrono::steady_clock::now() - t0).count());
+        emit logLine(QStringLiteral("TTS后端：%1").arg(to_q(impl->tts->provider_label())));
+    } catch (const std::exception& e) {
+        emit errorLine(QStringLiteral("TTS 切换失败：%1").arg(to_q(e.what())));
+    }
+
+    emit loadStageChanged(++step, total, kSwitchStages[step - 1]);
+
+    // 旧 StreamingSpeaker / TTSSpeaker 持有旧 TTS 指针，必须先停后清
+    if (impl->stream_speaker) { impl->stream_speaker->stop(); impl->stream_speaker.reset(); }
+    if (impl->speaker) { impl->speaker->stop(); impl->speaker.reset(); }
+
+    // 更新配置并持久化
+    if (!vadPath.empty()) impl->cfg.vad_model = vadPath;
+    if (!asrPath.empty()) impl->cfg.asr_model = asrPath;
+    if (!ttsPath.empty()) impl->cfg.tts_model = ttsPath;
+    if (!llmPath.empty()) impl->cfg.llm_model = llmPath;
+    impl->activeModels = paths;
+    persistConfig_();
+
+    emit logLine("模型切换完成。");
+    emit modelsChanged(paths);
+    emitModelStatus_();
 }
 
 void AgentController::handleTask_(const Task& task) {
@@ -877,123 +993,15 @@ void AgentController::persistConfig_() {
 
 void AgentController::handleSetModels_(const ModelPaths& paths) {
     if (!impl_) return;
-
-    // 停掉正在进行的语音
     if (listening_) {
         impl_->orch->stop();
         listening_ = false;
         emit audioStopped();
     }
-
-    const std::string& defVad = impl_->cfg.vad_model;
-    const std::string& defAsr = impl_->cfg.asr_model;
-    const std::string& defTts = impl_->cfg.tts_model;
-    const std::string& defLlm = impl_->cfg.llm_model;
-
-    const std::string vadPath = resolve_model(paths.vad, defVad, "models/vad");
-    const std::string asrPath = resolve_model(paths.asr, defAsr, "models/asr");
-    const std::string ttsPath = resolve_model(paths.tts, defTts, "models/tts");
-    const std::string llmPath = resolve_model(paths.llm, defLlm, "models/llm");
-
-    emit logLine(QStringLiteral("正在切换模型：VAD=%1  ASR=%2  TTS=%3  LLM=%4")
-                     .arg(to_q(vadPath), to_q(asrPath), to_q(ttsPath), to_q(llmPath)));
-
-    const int total = kSwitchStageCount();
-    int step = 0;
-    try {
-        // 重建模型模块
-        emit loadStageChanged(++step, total, kSwitchStages[step - 1]);
-        auto llm = std::make_shared<LLM>();
-        LLMConfig lc{};
-        lc.model_path = llmPath;
-        lc.n_gpu_layers = kLLMGpuLayers;
-        {
-            auto t0 = std::chrono::steady_clock::now();
-            markModelLoading_("LLM", llmPath);
-            llm->initialize(lc);
-            markModelReady_("LLM",
-                std::chrono::duration<double, std::milli>(
-                    std::chrono::steady_clock::now() - t0).count());
-        }
-
-        emit loadStageChanged(++step, total, kSwitchStages[step - 1]);
-        auto vad = std::make_shared<VAD>();
-        {
-            auto t0 = std::chrono::steady_clock::now();
-            markModelLoading_("VAD", vadPath);
-            vad->initialize(VADConfig{});
-            vad->set_model_path(vadPath, vadPath);
-            markModelReady_("VAD",
-                std::chrono::duration<double, std::milli>(
-                    std::chrono::steady_clock::now() - t0).count());
-        }
-
-        emit loadStageChanged(++step, total, kSwitchStages[step - 1]);
-        auto asr = std::make_shared<ASR>();
-        ASRConfig ac{};
-        ac.model_path = asrPath;
-        {
-            auto t0 = std::chrono::steady_clock::now();
-            markModelLoading_("ASR", asrPath);
-            asr->initialize(ac);
-            markModelReady_("ASR",
-                std::chrono::duration<double, std::milli>(
-                    std::chrono::steady_clock::now() - t0).count());
-        }
-        emit logLine(QStringLiteral("ASR后端：%1")
-                         .arg(asr->uses_real_backend()
-                                  ? QStringLiteral("Whisper(真实)")
-                                  : QStringLiteral("Mock(占位)")));
-
-        emit loadStageChanged(++step, total, kSwitchStages[step - 1]);
-        auto tts = std::make_shared<TTS>();
-        TTSConfig tc = tts_config_for_dir(ttsPath, impl_->cfg);
-        if (tc.engine.empty()) tc.engine = impl_->cfg.tts_engine;
-        {
-            auto t0 = std::chrono::steady_clock::now();
-            markModelLoading_("TTS", ttsPath);
-            tts->initialize(tc);
-            markModelReady_("TTS",
-                std::chrono::duration<double, std::milli>(
-                    std::chrono::steady_clock::now() - t0).count());
-        }
-        emit logLine(QStringLiteral("TTS后端：%1").arg(to_q(tts->provider_label())));
-
-        // 重建 Orchestrator（携带 agent + memory 挂载；音频管道沿用当前设备）
-        emit loadStageChanged(++step, total, kSwitchStages[step - 1]);
-        impl_->llm = std::move(llm);
-        impl_->vad = std::move(vad);
-        impl_->asr = std::move(asr);
-        impl_->tts = std::move(tts);
-        // 旧 StreamingSpeaker 持有旧 TTS 指针，重建前必须停掉并释放，
-        // 否则其合成线程会访问已销毁的 TTS（use-after-free）。
-        if (impl_->stream_speaker) {
-            impl_->stream_speaker->stop();
-            impl_->stream_speaker.reset();
-        }
-        if (impl_->speaker) {
-            impl_->speaker->stop();
-            impl_->speaker.reset();
-        }
-        impl_->orch = buildOrchestrator_(impl_->audio);
-
-        // 更新配置并持久化
-        if (!vadPath.empty()) impl_->cfg.vad_model = vadPath;
-        if (!asrPath.empty()) impl_->cfg.asr_model = asrPath;
-        if (!ttsPath.empty()) impl_->cfg.tts_model = ttsPath;
-        if (!llmPath.empty()) impl_->cfg.llm_model = llmPath;
-        if (!tc.engine.empty()) impl_->cfg.tts_engine = tc.engine;  // 引擎随模型目录自动识别
-        impl_->activeModels = paths;
-        persistConfig_();
-
-        emit logLine("模型切换完成。");
-        emit modelsChanged(paths);
-        emitModelStatus_();
-        emit loadFinished(true);
-    } catch (const std::exception& e) {
-        emit errorLine(QStringLiteral("模型切换失败：%1").arg(to_q(e.what())));
-        emit loadFinished(true);   // 旧模型仍可用，界面恢复可操作
-    }
+    // applyModelsWork_ 在 impl_ 上重建模型（in-place）；旧模型指针在 move 前始终有效。
+    // SEH 拦截切换期间的访问违规，保证 GUI 进程不崩溃，旧模型继续服务。
+    applyModelsGuarded_(impl_.get(), paths);
+    emit loadFinished(true);   // 旧模型仍可用，界面恢复可操作
 }
 
 std::shared_ptr<AudioPipeline> AgentController::createAudioPipeline_() {

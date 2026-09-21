@@ -117,6 +117,17 @@ private:
 
     void threadMain_();
     void initCore_();
+
+    // ===== SEH 就地防护（C2712：含 __try 的函数内不允许有带析构 的局部对象）=====
+    // 模型库（llama.cpp / ONNX Runtime）初始化可能直接触发访问违规（0xc0000005，
+    // 非 C++ 异常，try/catch 抓不到），放任会经 std::terminate 连 GUI 一起退出。
+    // 用 MSVC SEH 拦截：单模块崩溃回退安全态，保证"启动不退出、界面正常"。
+    // step/total 引用用于驱动 initCore_ 的进度条（SEH 拦截后 step 已停在失败阶段）。
+    int initModelsGuarded_(Impl* impl, int& step, int total);
+    void initModelsWork_(Impl* impl);     // 无 __try 的真实启动装载实现
+    int applyModelsGuarded_(Impl* impl, const ModelPaths& paths);
+    void applyModelsWork_(Impl* impl, const ModelPaths& paths);
+
     void handleTask_(const Task& task);
     void handleVoiceStart_();
     void handleVoiceStop_();

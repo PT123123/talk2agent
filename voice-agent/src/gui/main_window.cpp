@@ -2,7 +2,13 @@
 #include "gui/main_window.hpp"
 #include "util/log.hpp"
 
+#include <QtCore/QOperatingSystemVersion>
 #include <QApplication>
+
+// Windows Mica/亚克力效果
+#include <windows.h>
+#include <dwmapi.h>
+#pragma comment(lib, "dwmapi.lib")
 #include <QCheckBox>
 #include <QColor>
 #include <QEvent>
@@ -66,6 +72,30 @@ QString stageNameCn(const QString& key) {
 MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     setWindowTitle(QStringLiteral("Voice Agent — 本地全双工语音助手"));
     resize(1180, 760);
+
+    // ===== Windows 11 Mica 微光效果 =====
+    {
+        QOperatingSystemVersion os = QOperatingSystemVersion::current();
+        bool isWin11 = (os.majorVersion() > 10) ||
+                       (os.majorVersion() == 10 && os.minorVersion() >= 0 &&
+                        os.microVersion() >= 22000);
+        if (isWin11) {
+            // 方式一：DWMWA_SYSTEMBACKDROP_TYPE（Windows 11 22H2+，推荐）
+            auto hwnd = reinterpret_cast<HWND>(winId());
+            DWORD backdropType = 2; // 2 = Mica
+            DwmSetWindowAttribute(hwnd, 38 /*DWMWA_SYSTEMBACKDROP_TYPE*/,
+                                  &backdropType, sizeof(backdropType));
+            // 方式二：DWMWA_USE_HOSTBACKDROPBRUSH（Windows 11 21H1+）
+            DWORD useHostBackdrop = 1;
+            DwmSetWindowAttribute(hwnd, 37 /*DWMWA_USE_HOSTBACKDROPBRUSH*/,
+                                  &useHostBackdrop, sizeof(useHostBackdrop));
+            // 将内容区扩展到整个窗口，覆写标题栏区
+            MARGINS margins = {0, 0, 0, 0}; // 全0表示扩展整个客户区
+            DwmExtendFrameIntoClientArea(hwnd, &margins);
+            setStyleSheet("QMainWindow { background: transparent; }");
+        }
+        // 非 Windows 11：保持普通不透明窗口，不做处理
+    }
 
     buildUi_();
 
