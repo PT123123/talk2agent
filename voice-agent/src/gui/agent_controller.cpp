@@ -14,6 +14,7 @@
 #include "memory/memory_manager.hpp"
 #include "memory/memory_command.hpp"
 #include "tts/speaker.hpp"
+#include "tts/streaming_speaker.hpp"
 
 #include <QObject>
 #include <QFileInfo>
@@ -149,6 +150,7 @@ struct AgentController::Impl {
     std::string base_prompt{kSystemPrompt};
     std::string lastResponse;          // 最近一次回答（供"语音播报"按钮朗读）
     std::shared_ptr<TTSSpeaker> speaker;
+    std::shared_ptr<StreamingSpeaker> stream_speaker;   // 文本链路流式播报（边生成边播）
     ModelPaths activeModels;   // 当前实际启用的模型（相对 models/ 或空）
     bool tts_enabled{true};
 
@@ -695,6 +697,10 @@ void AgentController::handleSetTts_(bool enabled) {
     if (!impl_) return;
     impl_->tts_enabled = enabled;
     if (impl_->orch) impl_->orch->set_tts_enabled(enabled);
+    if (!enabled && impl_->stream_speaker) {
+        impl_->stream_speaker->stop();   // 关闭播报：立即中断正在进行的流式合成/播放
+        impl_->stream_speaker.reset();
+    }
     emit ttsEnabledChanged(enabled);
     emit logLine(enabled ? QStringLiteral("语音播报已开启。")
                          : QStringLiteral("语音播报已关闭（文字回复正常）。"));
@@ -838,6 +844,16 @@ void AgentController::handleSetModels_(const ModelPaths& paths) {
         impl_->vad = std::move(vad);
         impl_->asr = std::move(asr);
         impl_->tts = std::move(tts);
+        // 旧 StreamingSpeaker 持有旧 TTS 指针，重建前必须停掉并释放，
+        // 否则其合成线程会访问已销毁的 TTS（use-after-free）。
+        if (impl_->stream_speaker) {
+            impl_->stream_speaker->stop();
+            impl_->stream_speaker.reset();
+        }
+        if (impl_->speaker) {
+            impl_->speaker->stop();
+            impl_->speaker.reset();
+        }
         impl_->orch = buildOrchestrator_(impl_->audio);
 
         // 更新配置并持久化
@@ -966,20 +982,32 @@ void AgentController::handleText_(const QString& text) {
     loop.set_system_prompt(sys);
     // 工具意图门控：与语音路径一致，仅当用户明确要求（搜索/记忆/时间）时才放行
     loop.set_enabled_tools(detect_tool_intent(t));
-    loop.set_token_sink([this](const std::string& tok) { emit llmToken(to_q(tok)); });
+
+    // 文本链路流式播报：LLM 边生成，边按句喂给异步合成线程立即播放，
+    // 不再等整段合成完才开口（大幅压缩作答延迟）。
+    if (impl_->tts_enabled && impl_->tts && !impl_->stream_speaker) {
+        impl_->stream_speaker = std::make_shared<StreamingSpeaker>(impl_->tts.get());
+    }
+
+    loop.set_token_sink([this](const std::string& tok) {
+        emit llmToken(to_q(tok));
+        if (impl_->stream_speaker) {
+            impl_->stream_speaker->push_text(tok);
+        }
+    });
     loop.set_trace([this](const std::string& s, double ms) { onStage_(s, ms); });
     loop.set_tool_report([this](const std::string& l) { onToolEvent_(l); });
 
     auto res = loop.run(t, nullptr);
+    // 生成结束：收尾喂入残留文本并等待播完
+    if (impl_->stream_speaker) impl_->stream_speaker->flush();
+
     emitTurnTimeline_();
     impl_->turn_active = false;
     emitText_(res.final_text);
 
-    // 语音播报开启时，文本提问的回答也自动朗读（读最新回复）
-    if (impl_->tts_enabled && impl_->tts && !res.final_text.empty()) {
-        if (!impl_->speaker) impl_->speaker = std::make_shared<TTSSpeaker>(impl_->tts.get());
-        impl_->speaker->play(res.final_text);
-    }
+    // 等待流式播报把已合成的句子播完（异步合成线程在后台推进，不阻塞 GUI）
+    if (impl_->stream_speaker) impl_->stream_speaker->wait_done();
 
     // 记忆写入现在只发生在"明确指示"时：
     //   - 用户主动执行 /memory save
