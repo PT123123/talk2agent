@@ -185,6 +185,7 @@ inline AppConfig load_config(const std::string& path) {
     cfg.asr_model = j.value("asr_model", "models/asr/whisper-tiny");
     cfg.tts_model = j.value("tts_model", "models/tts/kokoro-multi-lang-v1_0");
     cfg.llm_model = j.value("llm_model", "models/qwen3-4b-q4_k_m.gguf");
+    cfg.tts_engine = j.value("tts_engine", "simple");
 
     // 搜索
     if (j.contains("search")) {

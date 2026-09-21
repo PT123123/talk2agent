@@ -67,6 +67,9 @@ public:
     // 切换麦克风输入设备（空串 = 系统默认设备），异步在 worker 线程重建音频管道
     void setAudioDevice(const QString& deviceName);
 
+    // 请求异步读取记忆库最近条目（供"共享记忆"侧栏展示）。结果经 memoryList 信号回传。
+    void requestMemoryList();
+
     // 当前麦克风输入电平（dBFS，供调试面板轮询；未采集时返回 -96）
     float inputLevelDb() const;
 
@@ -92,11 +95,12 @@ signals:
     void modelStatus(const QVariantMap& models); // 四类模型当前文件/大小/后端/就绪
     void stageTiming(const QString& stage, double ms); // 单轮某阶段实时耗时（毫秒）
     void turnTimeline(const QVariantMap& timeline);     // 一轮完成：各阶段耗时 + 汇总
+    void memoryList(const QVariantList& items);         // 记忆库最近条目（供"共享记忆"侧栏）
     void ttsEnabledChanged(bool enabled);       // TTS 开关状态变化
     void vadEnabledChanged(bool enabled);       // VAD 开关状态变化
 
 private:
-    enum class TaskType { StartVoice, StopVoice, SendText, SetModels, PlayResponse, RefreshLat, SetTts, SetVad, SetAudioDevice, Quit };
+    enum class TaskType { StartVoice, StopVoice, SendText, SetModels, PlayResponse, RefreshLat, SetTts, SetVad, SetAudioDevice, ListMemory, Quit };
     struct Task {
         TaskType type{TaskType::Quit};
         QString text;
@@ -116,6 +120,7 @@ private:
     void handleRefreshLat_();
     void handleSetTts_(bool enabled);
     void handleSetVad_(bool enabled);
+    void handleListMemory_();
     void emitText_(const std::string& text);   // llmComplete + 记录最近回答
     void persistConfig_();
 

@@ -15,13 +15,18 @@ class QCheckBox;
 class QGroupBox;
 class QLabel;
 class QLineEdit;
+class QListWidget;
+class QListWidgetItem;
 class QPlainTextEdit;
 class QProgressBar;
 class QPushButton;
+class QSplitter;
+class QStackedWidget;
 class QTabWidget;
 class QTableWidget;
 class QTextBrowser;
 class QTimer;
+class QToolButton;
 class QWidget;
 
 namespace voice_agent {
@@ -30,12 +35,11 @@ namespace gui {
 class SettingsPanel;
 
 // ========== 主窗口 ==========
-// Tab0：对话（状态式布局）；Tab1：设置（模型选择/下载/切换）
-// 对话页自上而下：
-//   模型状态条（四类模型 文件/大小/后端/就绪）
-//   语音控制行 + 流程阶段条（按住空格说 → VAD → ASR → LLM/工具 → TTS → 播放）
-//   中部分栏：左=对话，右=实时回复 + 工具/记忆
-//   底部：轮次耗时时间轴
+// ChatGPT 式三栏布局：
+//   左栏（对话/共享记忆侧栏）：新建对话、对话历史列表、共享记忆分组
+//   中栏（主对话区）：简洁的对话气泡流 + 底部输入（语音/文本），默认页
+//   右栏（可折叠日志侧栏）：模型状态条 + 工具/记忆/运行日志 + 轮次耗时
+// 对话页自上而下：标题行 → 对话流（含流式气泡）→ 处理流程条 → 控制行 → 输入行
 class MainWindow final : public QMainWindow {
     Q_OBJECT
 
@@ -60,6 +64,14 @@ private slots:
     void onLoadStage_(int step, int total, const QString& label);
     void onLoadFinished_(bool ok);
     void updateLoadLabel_();
+    // 侧栏导航 / 对话 / 记忆
+    void onNewConversation_();
+    void onConversationClicked_(QListWidgetItem* item);
+    void onToggleLeft_();
+    void onToggleRight_();
+    void onSettingsNav_();
+    void onMemoryList_(const QVariantList& items);
+    void onMemoryActivated_(QListWidgetItem* item);
 
     // 新面板
     void onModelStatus(const QVariantMap& models);
@@ -69,12 +81,17 @@ private slots:
 
 private:
     void buildUi_();
+    void buildLeftSidebar_();
+    void buildChatPage_();
+    void buildRightSidebar_();
     void connectSignals_();
     void setControlsEnabled_(bool enabled);
     void resetLive_();
     void refreshTimelineTable_();
     QString stagePlainStyle_() const;
     QString stageDisplayName_(const QString& key) const;
+    void refreshConversationBadges_();  // 高亮当前激活对话
+    void refreshMemoryList_();          // 触发控制器读取记忆 → onMemoryList_
     // 在对话区追加一条消息；仅在"贴底"模式下自动滚动到最新
     void appendChatBubble_(const QString& who, const QString& text,
                            const char* color, const char* icon);
@@ -101,7 +118,23 @@ private:
 
     AgentController* controller_ = nullptr;
     SettingsPanel* settings_ = nullptr;
-    QTabWidget* tabs_ = nullptr;
+
+    // ===== 三栏布局 =====
+    QWidget* leftSidebar_ = nullptr;    // 左栏：对话 / 共享记忆
+    QWidget* rightSidebar_ = nullptr;   // 右栏：日志（可折叠）
+    QSplitter* centerRightSplit_ = nullptr;
+    QStackedWidget* centerStack_ = nullptr;   // 0=对话页 1=设置页
+    QWidget* chatPage_ = nullptr;
+    QToolButton* leftToggleBtn_ = nullptr;    // 左栏折叠开关
+    QToolButton* rightToggleBtn_ = nullptr;   // 右栏折叠开关
+    QPushButton* newConvBtn_ = nullptr;
+    QPushButton* settingsNavBtn_ = nullptr;
+    QListWidget* convList_ = nullptr;
+    QListWidget* memList_ = nullptr;
+    QLabel* pageTitle_ = nullptr;
+    int convCounter_ = 0;
+    QListWidgetItem* activeConvItem_ = nullptr;
+    int activeConvIndex_ = -1;
 
     QLabel* statusLabel_ = nullptr;
     QPushButton* voiceBtn_ = nullptr;
@@ -111,8 +144,8 @@ private:
     QLineEdit* input_ = nullptr;
     QPushButton* sendBtn_ = nullptr;
     QTextBrowser* chat_ = nullptr;
-    QPlainTextEdit* replyView_ = nullptr;   // 实时回复（流式，与工具调用分开）
-    QPlainTextEdit* toolsView_ = nullptr;   // 工具 / 记忆 / 日志
+    QTextBrowser* streamBubble_ = nullptr;   // 流式回答气泡（主对话区内联、隐藏时为空）
+    QPlainTextEdit* toolsView_ = nullptr;   // 工具 / 记忆 / 日志（右侧栏）
 
     // 模型状态条（索引对应 VAD/ASR/TTS/LLM）
     QLabel* modelChips_[4] = {nullptr, nullptr, nullptr, nullptr};

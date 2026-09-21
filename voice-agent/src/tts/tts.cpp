@@ -1,5 +1,6 @@
 // src/tts/tts.cpp
-#include "tts.hpp"
+#include "tts/tts.hpp"
+#include "tts/sapi_speaker.hpp"
 #include "util/log.hpp"
 #include <chrono>
 #include <cmath>
@@ -18,6 +19,10 @@ namespace voice_agent {
 struct TTS::Impl {
     TTSCallback callback;
     TTSConfig cfg_;
+
+    // 简单引擎：Windows 系统语音（免模型）
+    std::shared_ptr<SapiSpeaker> sapi;
+    std::function<void()> done_cb;
 
 #ifdef USE_SHERPAONNX
     const SherpaOnnxOfflineTts* tts_{nullptr};
@@ -68,8 +73,43 @@ struct TTS::Impl {
     }
 #endif
 
+    // ---- 简单引擎辅助 ----
+    void set_speech_done_callback_impl() {
+        if (!sapi) return;
+        sapi->set_done_callback([this] {
+            auto cb = done_cb;
+            if (cb) cb();
+        });
+    }
+    void set_speech_done_callback(std::function<void()> cb) {
+        done_cb = std::move(cb);
+        if (sapi) {
+            sapi->set_done_callback([this] {
+                auto cb = done_cb;
+                if (cb) cb();
+            });
+        }
+    }
+    void speak_simple(const std::string& text) {
+        if (sapi) sapi->speak(text);
+    }
+
     bool load(const TTSConfig& config) {
         cfg_ = config;
+
+        // ---- 简单引擎（默认）：Windows 系统语音，零模型、即时、可流式 ----
+        if (config.engine == "simple") {
+            sapi = std::make_shared<SapiSpeaker>();
+            const bool ok = sapi->initialize();
+            if (ok) {
+                LOG_INFO("SimpleTTS(SAPI): 系统语音就绪，voice={}", sapi->voice_name());
+                set_speech_done_callback_impl();
+            } else {
+                LOG_WARN("SimpleTTS(SAPI): 系统语音不可用（朗读将不发声）");
+            }
+            return true;
+        }
+
 #ifdef USE_SHERPAONNX
         // provider: auto → 运行时支持 DirectML 就用 GPU，否则 CPU
         std::string prov = config.provider;
@@ -92,6 +132,11 @@ struct TTS::Impl {
     }
 
     std::vector<int16_t> synthesize(const TTSConfig& config, const std::string& text) {
+        // 简单引擎：直接调用系统语音朗读（异步、即时出声），不返回采样
+        if (sapi) {
+            speak_simple(text);
+            return {};
+        }
 #ifdef USE_SHERPAONNX
         if (!tts_) return {};
 
@@ -143,7 +188,9 @@ struct TTS::Impl {
 #endif
     }
 
-    void stop() {}
+    void stop() {
+        if (sapi) sapi->stop();
+    }
 };
 
 // ========== TTS 主类实现 ==========
@@ -153,6 +200,7 @@ TTS::~TTS() = default;
 
 bool TTS::initialize(const TTSConfig& config) {
     config_ = config;
+    simple_engine_ = (config.engine == "simple");
     impl_ = std::make_unique<Impl>();
 
     if (!impl_->load(config)) {
@@ -160,8 +208,8 @@ bool TTS::initialize(const TTSConfig& config) {
         return false;
     }
 
-    LOG_INFO("TTS: initialized {} Hz, speed={}, lang={}, speaker={}",
-             config.sample_rate, config.speed, config.lang, config.speaker_id);
+    LOG_INFO("TTS: engine={} init, speed={}, lang={}, speaker={}",
+             config.engine, config.speed, config.lang, config.speaker_id);
     return true;
 }
 
@@ -186,6 +234,19 @@ void TTS::synthesize_stream(const std::string& text, TTSCallback callback) {
     impl_->callback = callback;
 
     const auto t0 = std::chrono::steady_clock::now();
+
+    // 简单引擎：文本直接交给系统语音实时朗读，随后通知一次"流结束"
+    if (simple_engine_) {
+        impl_->synthesize(config_, text);
+        last_synthesize_ms.store(
+            std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - t0)
+                .count());
+        synthesizing_ = false;
+        if (callback) callback(nullptr, 0, true);
+        return;
+    }
+
     auto audio = impl_->synthesize(config_, text);
     size_t chunk_size = 4800;  // 200ms @ 24kHz
 
@@ -215,7 +276,17 @@ void TTS::set_cancel_token(std::shared_ptr<CancelToken> token) {
     cancel_token_ = std::move(token);
 }
 
+void TTS::set_speech_done_callback(std::function<void()> cb) {
+    if (impl_) impl_->set_speech_done_callback(std::move(cb));
+}
+
+std::string TTS::simple_voice_name() const {
+    if (impl_ && impl_->sapi) return impl_->sapi->voice_name();
+    return {};
+}
+
 bool TTS::uses_real_backend() const {
+    if (simple_engine_) return impl_ && impl_->sapi && impl_->sapi->available();
 #ifdef USE_SHERPAONNX
     return impl_ && impl_->tts_ != nullptr;
 #else
@@ -224,6 +295,7 @@ bool TTS::uses_real_backend() const {
 }
 
 std::string TTS::provider_label() const {
+    if (simple_engine_) return "系统语音(SAPI)";
 #ifdef USE_SHERPAONNX
     if (!impl_ || !impl_->tts_) return "Mock";
     return impl_->provider_ == "directml" ? "DirectML GPU" : "CPU";

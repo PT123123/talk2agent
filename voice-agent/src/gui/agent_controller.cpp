@@ -270,6 +270,13 @@ void AgentController::setAudioDevice(const QString& deviceName) {
     cv_.notify_all();
 }
 
+void AgentController::requestMemoryList() {
+    Task t{TaskType::ListMemory, {}};
+    std::lock_guard<std::mutex> lk(mtx_);
+    queue_.push_back(std::move(t));
+    cv_.notify_all();
+}
+
 float AgentController::inputLevelDb() const {
     if (!impl_ || !impl_->audio) return -96.0f;
     return impl_->audio->last_input_level_db();
@@ -408,6 +415,7 @@ void AgentController::initCore_() {
                                   : QStringLiteral("Mock(占位)")));
 
         TTSConfig tc = kokoro_config(impl->cfg.tts_model);
+        tc.engine = impl->cfg.tts_engine;   // "simple"(默认,系统语音) / "kokoro"(模型)
         emit loadStageChanged(++step, total, kInitStages[step - 1]);
         {
             auto t0 = std::chrono::steady_clock::now();
@@ -418,9 +426,7 @@ void AgentController::initCore_() {
                     std::chrono::steady_clock::now() - t0).count());
         }
         emit logLine(QStringLiteral("TTS后端：%1")
-                         .arg(impl->tts->uses_real_backend()
-                                  ? QStringLiteral("Kokoro(真实)")
-                                  : QStringLiteral("Mock(占位)")));
+                         .arg(to_q(impl->tts->provider_label())));
     } catch (...) {
         emit logLine("模型加载失败，回退 Mock 模式（界面仍可正常使用）。");
     }
@@ -477,6 +483,7 @@ void AgentController::handleTask_(const Task& task) {
         case TaskType::RefreshLat:  handleRefreshLat_(); break;
         case TaskType::SetTts:      handleSetTts_(task.flag); break;
         case TaskType::SetVad:      handleSetVad_(task.flag); break;
+        case TaskType::ListMemory: handleListMemory_(); break;
         default: break;
     }
 }
@@ -528,6 +535,24 @@ void AgentController::handleRefreshLat_() {
     }
     if (impl_->tts) m[QStringLiteral("TTS 合成")] = impl_->tts->last_synthesize_ms.load();
     emit latencySnapshot(m);
+}
+
+void AgentController::handleListMemory_() {
+    if (!impl_ || !impl_->memory) {
+        emit memoryList(QVariantList{});
+        return;
+    }
+    QVariantList out;
+    const auto items = impl_->memory->store()->list(200, 0);
+    for (const auto& m : items) {
+        QVariantMap x;
+        x[QStringLiteral("id")] = static_cast<qlonglong>(m.id);
+        x[QStringLiteral("subject")] = to_q(m.subject);
+        x[QStringLiteral("content")] = to_q(m.content);
+        x[QStringLiteral("created_at")] = static_cast<qlonglong>(m.created_at);
+        out.append(x);
+    }
+    emit memoryList(out);
 }
 
 void AgentController::emitText_(const std::string& text) {
@@ -635,7 +660,11 @@ void AgentController::emitModelStatus_() {
                     std::string("Silero")};
         if (key == "ASR")
             return {impl_->asr && impl_->asr->uses_real_backend(), "Whisper"};
-        return {impl_->tts && impl_->tts->uses_real_backend(), "Kokoro"};
+        if (impl_->tts)
+            return {impl_->tts->uses_real_backend(),
+                    impl_->tts->simple_engine() ? "系统语音(SAPI)"
+                                                : std::string("Kokoro")};
+        return {false, "Mock"};
     };
 
     // 生效推理后端（Vulkan GPU / DirectML GPU / CPU / Mock）
@@ -825,6 +854,7 @@ void AgentController::handleSetModels_(const ModelPaths& paths) {
         emit loadStageChanged(++step, total, kSwitchStages[step - 1]);
         auto tts = std::make_shared<TTS>();
         TTSConfig tc = kokoro_config(ttsPath);
+        tc.engine = impl_->cfg.tts_engine;
         {
             auto t0 = std::chrono::steady_clock::now();
             markModelLoading_("TTS", ttsPath);
@@ -834,9 +864,7 @@ void AgentController::handleSetModels_(const ModelPaths& paths) {
                     std::chrono::steady_clock::now() - t0).count());
         }
         emit logLine(QStringLiteral("TTS后端：%1")
-                         .arg(tts->uses_real_backend()
-                                  ? QStringLiteral("Kokoro(真实)")
-                                  : QStringLiteral("Mock(占位)")));
+                         .arg(to_q(tts->provider_label())));
 
         // 重建 Orchestrator（携带 agent + memory 挂载；音频管道沿用当前设备）
         emit loadStageChanged(++step, total, kSwitchStages[step - 1]);
@@ -882,6 +910,9 @@ std::shared_ptr<AudioPipeline> AgentController::createAudioPipeline_() {
     ac.frames_per_buffer =
         std::max(1, impl_->cfg.audio_sample_rate * impl_->cfg.audio_buffer_ms / 1000);
     ac.input_device = impl_->audio_device_name;
+    // 输出设备按 TTS 采样率（24kHz）独立配采样率，否则 48kHz 设备播放 24kHz
+    // TTS 音频会变速（2 倍速）；须在 initialize() 之前设置。
+    if (impl_->tts) audio->set_output_rate(impl_->tts->config().sample_rate);
     if (!audio->initialize(ac)) {
         emit errorLine("麦克风/扬声器初始化失败，语音输入将不可用（可先检查系统录音权限）。");
     } else {

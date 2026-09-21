@@ -180,6 +180,7 @@ struct AppConfig {
     std::string asr_model;
     std::string tts_model;
     std::string llm_model;
+    std::string tts_engine{"simple"};  // "simple"=系统语音(SAPI,默认)；"kokoro"=本地Kokoro模型
 
     // 搜索
     std::string searxng_url{"http://localhost:8080"};

@@ -49,10 +49,25 @@ bool AudioPipeline::initialize(const AudioConfig& config) {
     });
     
     // 初始化输出设备
-    if (!impl_->output_device.init_as_output(config)) {
+    AudioConfig out_cfg = config;
+    if (output_rate_ > 0) out_cfg.sample_rate = output_rate_;
+    if (!impl_->output_device.init_as_output(out_cfg)) {
         LOG_ERROR("Failed to initialize output device");
         return false;
     }
+
+    // 关键：把输出设备的真实播放回调接到 pipeline 层播放回调（由调用者
+    // 填入缓冲；缺省填静音）。此前缺此接线导致 miniaudio 回调输出静音，
+    // 语音链路的自动播报因此一直无声。
+    impl_->output_device.set_playback_callback(
+        [this](int16_t* data, size_t frames) -> size_t {
+            if (impl_->playback_callback) {
+                impl_->playback_callback(data, frames);
+            } else {
+                std::memset(data, 0, frames * sizeof(int16_t));
+            }
+            return frames;
+        });
     
     LOG_INFO("Audio pipeline initialized");
     return true;

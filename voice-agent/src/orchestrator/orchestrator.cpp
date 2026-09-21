@@ -39,6 +39,27 @@ bool sentence_has_content(const std::string& s) {
     }
     return false;
 }
+
+// 判断多字节 UTF-8 序列尾部是否完整；返回需"保留在累积缓冲"的最小字节数。
+// 简单引擎按 token 直灌系统语音时，避免把一个中文字符切成两半。
+size_t utf8_hold_back(const std::string& s) {
+    if (s.empty()) return 0;
+    size_t i = s.size();
+    int cont = 0;
+    size_t need = 0;
+    for (; i > 0; --i) {
+        unsigned char c = static_cast<unsigned char>(s[i - 1]);
+        if ((c & 0xC0) == 0x80) { ++cont; continue; }
+        if ((c & 0x80) == 0) return 0;
+        if ((c & 0xE0) == 0xC0) need = 2;
+        else if ((c & 0xF0) == 0xE0) need = 3;
+        else if ((c & 0xF8) == 0xF0) need = 4;
+        else need = 1;
+        break;
+    }
+    size_t have = s.size() - (i - 1);
+    return (have >= need) ? 0 : need - have;
+}
 }  // namespace
 
 // ========== 构造函数 / 析构函数 ==========
@@ -525,20 +546,38 @@ void Orchestrator::on_llm_token_(const LLMResponse& chunk) {
             tts_->set_cancel_token(session_token_);
             tts_accum_active_ = true;
 
-            // ---- 句级切分：累积到句子边界才整句合成 ----
-            stream_sentence_ += chunk.text;
-            size_t cut = 0;
-            while ((cut = find_sentence_boundary(stream_sentence_)) != std::string::npos) {
-                std::string sentence = stream_sentence_.substr(0, cut + 1);
-                stream_sentence_.erase(0, cut + 1);
-                // 纯空白/标点组成的空句跳过，避免无谓的单字符合成
-                if (sentence_has_content(sentence)) {
-                    const double t0 = now_ms();
-                    tts_->synthesize_stream(sentence,
-                        [this](const int16_t* audio, size_t frames, bool is_last) {
-                            on_tts_chunk_(audio, frames, is_last);
-                        });
-                    tts_accum_ms_.store(tts_accum_ms_.load() + (now_ms() - t0));
+            if (tts_->simple_engine()) {
+                // ---- 简单引擎（系统语音）：token 一到就直灌，实现"出一个字念一个" ----
+                stream_sentence_ += chunk.text;
+                const size_t hold = utf8_hold_back(stream_sentence_);
+                if (hold < stream_sentence_.size()) {
+                    std::string ready = stream_sentence_.substr(0, stream_sentence_.size() - hold);
+                    stream_sentence_.erase(0, stream_sentence_.size() - hold);
+                    if (!ready.empty()) {
+                        const double t0 = now_ms();
+                        tts_->synthesize_stream(ready,
+                            [this](const int16_t* audio, size_t frames, bool is_last) {
+                                on_tts_chunk_(audio, frames, is_last);
+                            });
+                        tts_accum_ms_.store(tts_accum_ms_.load() + (now_ms() - t0));
+                    }
+                }
+            } else {
+                // ---- 模型（Kokoro）：句级切分，累积到句子边界才整句合成 ----
+                stream_sentence_ += chunk.text;
+                size_t cut = 0;
+                while ((cut = find_sentence_boundary(stream_sentence_)) != std::string::npos) {
+                    std::string sentence = stream_sentence_.substr(0, cut + 1);
+                    stream_sentence_.erase(0, cut + 1);
+                    // 纯空白/标点组成的空句跳过，避免无谓的单字符合成
+                    if (sentence_has_content(sentence)) {
+                        const double t0 = now_ms();
+                        tts_->synthesize_stream(sentence,
+                            [this](const int16_t* audio, size_t frames, bool is_last) {
+                                on_tts_chunk_(audio, frames, is_last);
+                            });
+                        tts_accum_ms_.store(tts_accum_ms_.load() + (now_ms() - t0));
+                    }
                 }
             }
         }

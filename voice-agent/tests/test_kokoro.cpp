@@ -16,6 +16,7 @@ int main(int argc, char** argv) {
                                 : std::string("models/tts/kokoro-multi-lang-v1_0");
 
     TTSConfig tc;
+    tc.engine = "kokoro";   // 该测试专门验证模型引擎，需显式指定，避开默认"simple(系统语音)"
     tc.model_path = dir + "/model.onnx";
     tc.voice_path = dir + "/voices.bin";
     tc.tokens_path = dir + "/tokens.txt";

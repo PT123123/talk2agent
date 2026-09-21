@@ -32,6 +32,14 @@ bool TTSSpeaker::play(const std::string& text) {
     if (!tts_ || text.empty()) return false;
     stop();
 
+    // 简单引擎：系统语音自己出声（异步），这里无需采样播放，返回成功即可，
+    // 只需稍作等待以确保语音开始朗读（不必等整段播完）。
+    if (tts_->simple_engine()) {
+        tts_->synthesize(text);
+        std::this_thread::sleep_for(std::chrono::milliseconds(80));
+        return true;
+    }
+
     try {
         samples_ = tts_->synthesize(text);
     } catch (const std::exception& e) {

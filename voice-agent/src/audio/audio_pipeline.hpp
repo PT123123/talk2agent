@@ -29,6 +29,10 @@ public:
     // 设置播放回调（接收要播放的音频）
     void set_playback_callback(AudioPlaybackCallback cb);
 
+    // 设置输出设备采样率（默认取 config.sample_rate；TTS 音频通常为 24kHz，
+    // 独立设置可避免变速）。须在 initialize() 之前调用。
+    void set_output_rate(int rate) { output_rate_ = rate; }
+
     // 启动管道
     bool start();
 
@@ -62,6 +66,7 @@ private:
     std::unique_ptr<Impl> impl_;
 
     AudioConfig config_;
+    int output_rate_{0};   // 0 = 跟随 config.sample_rate
     std::atomic<bool> running_{false};
     std::atomic<float> last_input_level_db_{-96.0f};
     

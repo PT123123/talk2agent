@@ -79,6 +79,12 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/test_probe.cpp)
     target_link_libraries(test_probe PRIVATE voice_agent_core)
 endif()
 
+# 简单 TTS（SAPI）冒烟测试：初始化 + 朗读（人工可听到出声）。非自动 ctest。
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/test_sapi.cpp)
+    add_executable(test_sapi test_sapi.cpp)
+    target_link_libraries(test_sapi PRIVATE voice_agent_core)
+endif()
+
 # 端到端语音链路：Silero VAD → Whisper tiny ONNX（真实语音→文本）
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/test_vad_asr.cpp AND ONNXRUNTIME_LIB)
     add_executable(test_vad_asr test_vad_asr.cpp)

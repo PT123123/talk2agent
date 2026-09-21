@@ -230,6 +230,7 @@ set(CORE_SOURCES
     src/asr/whisper_frontend.cpp
     src/asr/whisper_onnx.cpp
     src/tts/tts.cpp
+    src/tts/sapi_speaker.cpp
     src/tts/speaker.cpp
     src/tts/streaming_speaker.cpp
     src/llm/llm.cpp
@@ -322,6 +323,8 @@ if(TARGET llama)
 endif()
 if(WIN32)
     target_link_libraries(voice_agent_core PRIVATE ws2_32 dxgi)
+    # SAPI 系统语音（简单 TTS 默认引擎）；含 COM Variant（oleaut32）与 COM 初始化（ole32）
+    target_link_libraries(voice_agent_core PRIVATE sapi ole32 oleaut32)
 endif()
 
 # ========== Qt6 GUI ==========

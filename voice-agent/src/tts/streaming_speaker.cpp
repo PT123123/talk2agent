@@ -188,6 +188,23 @@ StreamingSpeaker::~StreamingSpeaker() {
 
 void StreamingSpeaker::push_text(const std::string& chunk) {
     if (chunk.empty()) return;
+
+    // 简单引擎（系统语音）：文本一到就直接朗读，实现"出一个字念一个字"的实时流式。
+    // 仅做 UTF-8 完整字节保护，不做句子缓冲（系统语音无整句合成延迟）。
+    if (impl_->tts && impl_->tts->simple_engine()) {
+        std::string ready;
+        {
+            std::lock_guard<std::mutex> lk(impl_->queue_mtx);
+            impl_->buffer_ += chunk;
+            size_t hold = utf8_hold_back(impl_->buffer_);
+            if (hold == impl_->buffer_.size()) return;   // 尾部仍是未完成字符，等下一块
+            ready = impl_->buffer_.substr(0, impl_->buffer_.size() - hold);
+            impl_->buffer_ = impl_->buffer_.substr(impl_->buffer_.size() - hold);
+        }
+        if (!ready.empty()) impl_->tts->synthesize(ready);   // 即时，无合成延迟，直接入 SAPI 队列
+        return;
+    }
+
     static constexpr size_t kMaxChunk = 40;   // 无标点时最长攒多少字符就强制切，防止等你等到天荒地老
     {
         std::lock_guard<std::mutex> lk(impl_->queue_mtx);
@@ -215,6 +232,16 @@ void StreamingSpeaker::push_text(const std::string& chunk) {
 }
 
 void StreamingSpeaker::flush() {
+    // 简单引擎：把残余（可能未到分出条件的完整字符）也交给系统语音，随后无需内存播放
+    if (impl_->tts && impl_->tts->simple_engine()) {
+        std::string tail;
+        {
+            std::lock_guard<std::mutex> lk(impl_->queue_mtx);
+            tail = std::move(impl_->buffer_);
+        }
+        if (!tail.empty()) impl_->tts->synthesize(tail);
+        return;
+    }
     {
         std::lock_guard<std::mutex> lk(impl_->queue_mtx);
         if (!impl_->buffer_.empty() && has_speech(impl_->buffer_))
@@ -226,6 +253,7 @@ void StreamingSpeaker::flush() {
 
 void StreamingSpeaker::stop() {
     impl_->stop_playback();
+    if (impl_->tts && impl_->tts->simple_engine()) impl_->tts->stop();   // 同时清空系统语音队列
     {
         std::lock_guard<std::mutex> lk(impl_->queue_mtx);
         impl_->pending.clear();
