@@ -178,6 +178,14 @@ private:
     void on_llm_token_(const LLMResponse& chunk);
     void on_llm_complete_();
 
+    // 流式播放状态：Thinking 期间首段音频就已开始播放，
+    // 无需等 LLM 全部生成完（避免 TTS 憋满整段才开口）。
+    std::atomic<bool> speech_started_{false};
+
+    // 句级流式缓冲：把 LLM 增量 token 累积到句子边界（。！？；… 等），
+    // 才交给 TTS 整句合成。避免"每 token 单独合成"导致的 TTS 总耗时暴增。
+    std::string stream_sentence_;
+
     // ========== TTS 回调 ==========
     void on_tts_chunk_(const int16_t* audio, size_t frames, bool is_last);
 

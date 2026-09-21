@@ -231,6 +231,7 @@ set(CORE_SOURCES
     src/asr/whisper_onnx.cpp
     src/tts/tts.cpp
     src/tts/speaker.cpp
+    src/tts/streaming_speaker.cpp
     src/llm/llm.cpp
     src/agent/grammar.cpp
     src/agent/tool_registry.cpp

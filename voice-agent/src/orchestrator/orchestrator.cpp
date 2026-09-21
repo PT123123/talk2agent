@@ -1,6 +1,7 @@
 // src/orchestrator/orchestrator.cpp
 #include "orchestrator.hpp"
 #include "util/log.hpp"
+#include <cctype>
 #include <cstring>
 #include <chrono>
 
@@ -11,6 +12,32 @@ inline double now_ms() {
     return std::chrono::duration<double, std::milli>(
                std::chrono::steady_clock::now().time_since_epoch())
         .count();
+}
+
+// 找到第一个"句子结束"标点（用于把 LLM 流式文本切成可整句合成的块）。
+// 支持中英标点与换行；找不到返回 npos。返回下标（含该标点）。
+size_t find_sentence_boundary(const std::string& s) {
+    for (size_t i = 0; i < s.size(); ++i) {
+        const char c = s[i];
+        if (c == '。' || c == '！' || c == '？' || c == '；' ||
+            c == '!' || c == '?' || c == ';' || c == '\n' ||
+            c == '…') {
+            return i;
+        }
+    }
+    return std::string::npos;
+}
+
+// 句子内是否含非空白/标点的实际内容（排除纯符号/空白片段）
+bool sentence_has_content(const std::string& s) {
+    for (unsigned char c : s) {
+        if (c > 0x7F) return true;              // 含任意非 ASCII（中文等）
+        if (!std::isspace(c)) {
+            if (strchr("，。！？；：、,.!?;:()[]{}《》“”‘’\"'-", c) == nullptr)
+                return true;
+        }
+    }
+    return false;
 }
 }  // namespace
 
@@ -349,6 +376,7 @@ void Orchestrator::enter_thinking_(const std::string& text) {
     session_token_ = std::make_shared<CancelToken>();
     tts_accum_ms_.store(0.0);
     tts_accum_active_ = false;
+    speech_started_.store(false);   // 新一轮 Thinking：等待首段音频以即时开播
 
     // ---- /memory 命令：直接执行并播报，不走 LLM ----
     if (memory_ && is_memory_command(text)) {
@@ -487,8 +515,7 @@ void Orchestrator::on_llm_token_(const LLMResponse& chunk) {
             accumulated_text_ += chunk.text;
         }
 
-        // 回调给上层（流式增量 → 实时回复面板；不在此处触发"完整回答"，
-        // 避免每个 token 都产生一条 llmComplete 气泡）
+        // 回调给上层（流式增量 → 实时回复面板）
         if (token_cb_) {
             token_cb_(chunk.text);
         }
@@ -497,12 +524,23 @@ void Orchestrator::on_llm_token_(const LLMResponse& chunk) {
         if (tts_ && tts_enabled_.load() && state_.load() == State::Thinking) {
             tts_->set_cancel_token(session_token_);
             tts_accum_active_ = true;
-            const double t0 = now_ms();
-            tts_->synthesize_stream(chunk.text,
-                [this](const int16_t* audio, size_t frames, bool is_last) {
-                    on_tts_chunk_(audio, frames, is_last);
-                });
-            tts_accum_ms_.store(tts_accum_ms_.load() + (now_ms() - t0));
+
+            // ---- 句级切分：累积到句子边界才整句合成 ----
+            stream_sentence_ += chunk.text;
+            size_t cut = 0;
+            while ((cut = find_sentence_boundary(stream_sentence_)) != std::string::npos) {
+                std::string sentence = stream_sentence_.substr(0, cut + 1);
+                stream_sentence_.erase(0, cut + 1);
+                // 纯空白/标点组成的空句跳过，避免无谓的单字符合成
+                if (sentence_has_content(sentence)) {
+                    const double t0 = now_ms();
+                    tts_->synthesize_stream(sentence,
+                        [this](const int16_t* audio, size_t frames, bool is_last) {
+                            on_tts_chunk_(audio, frames, is_last);
+                        });
+                    tts_accum_ms_.store(tts_accum_ms_.load() + (now_ms() - t0));
+                }
+            }
         }
 
         // LLM 结束
@@ -514,6 +552,18 @@ void Orchestrator::on_llm_token_(const LLMResponse& chunk) {
 
 void Orchestrator::on_llm_complete_() {
     if (!running_.load()) return;
+
+    // 把未到句子边界的残留文本合成（LLM 结束但尾句无标点，也要播出来）
+    if (!stream_sentence_.empty() && tts_ && tts_enabled_.load()) {
+        std::string tail = std::move(stream_sentence_);
+        tts_accum_active_ = true;
+        const double t0 = now_ms();
+        tts_->synthesize_stream(tail,
+            [this](const int16_t* audio, size_t frames, bool is_last) {
+                on_tts_chunk_(audio, frames, is_last);
+            });
+        tts_accum_ms_.store(tts_accum_ms_.load() + (now_ms() - t0));
+    }
 
     std::string final_text;
     {
@@ -537,7 +587,12 @@ void Orchestrator::on_llm_complete_() {
     }
 
     if (!final_text.empty()) {
-        enter_speaking_();
+        // 已在流式播放中（on_tts_chunk_ 触发过 enter_speaking_）：保持 Speaking，
+        // 不要再次 enter_speaking_——那会重跑 start_playback() 清空已缓冲的音频。
+        // TTS 关闭或无流式音频时才据此进入 Speaking（空结束 → 兜底一次）。
+        if (!speech_started_.load()) {
+            enter_speaking_();
+        }
     } else {
         enter_idle_();
     }
@@ -547,6 +602,12 @@ void Orchestrator::on_llm_complete_() {
 
 void Orchestrator::on_tts_chunk_(const int16_t* audio, size_t frames, bool is_last) {
     if (!running_.load()) return;
+
+    // 流式播放：Thinking 阶段首段音频一到，立即进入 Speaking 并开始播放，
+    // 不必等 LLM 全部生成完（否则 TTS 音频会憋在 AudioRouter 里直到结束才出声）。
+    if (state_.load() == State::Thinking && !speech_started_.exchange(true)) {
+        enter_speaking_();
+    }
 
     if (audio_router_.is_playing()) {
         audio_router_.push_tts_frames(audio, frames);
