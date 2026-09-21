@@ -103,15 +103,51 @@ std::string resolve_model(const QString& sel, const std::string& def,
     return prefix + "/" + def;
 }
 
-// 用 Kokoro 模型目录（含 model.onnx/voices.bin/tokens.txt/espeak-ng-data）填充 TTS 配置
-TTSConfig kokoro_config(const std::string& dir) {
+// 探测 TTS 模型目录类型："kokoro"（含 voices.bin）/ "piper"（含 espeak-ng-data + onnx）/ 空
+std::string detect_tts_engine(const std::string& dir) {
+    if (dir.empty()) return {};
+    std::error_code ec;
+    if (std::filesystem::exists(dir + "/voices.bin", ec)) return "kokoro";
+    if (std::filesystem::exists(dir + "/espeak-ng-data", ec)) return "piper";
+    return {};
+}
+
+// 在 Piper 目录内定位 <voice>.onnx（优先 model.onnx，其次任一 *.onnx）
+std::string find_piper_onnx(const std::string& dir) {
+    if (dir.empty()) return {};
+    std::error_code ec;
+    if (std::filesystem::exists(dir + "/model.onnx", ec))
+        return dir + "/model.onnx";
+    for (const auto& e : std::filesystem::directory_iterator(dir, ec)) {
+        if (e.is_regular_file(ec) && e.path().extension() == ".onnx")
+            return e.path().string();
+    }
+    return {};
+}
+
+// 按 TTS 模型目录自动构建配置（Kokoro / Piper 目录均可识别）；
+// 目录不可识别时返回空 engine，由调用方回退到配置的 tts_engine。
+TTSConfig tts_config_for_dir(const std::string& dir, const AppConfig& cfg) {
     TTSConfig tc{};
-    tc.model_path = dir + "/model.onnx";
-    tc.voice_path = dir + "/voices.bin";
-    tc.tokens_path = dir + "/tokens.txt";
-    tc.data_dir = dir + "/espeak-ng-data";
-    tc.lexicon = dir + "/lexicon-zh.txt";
-    tc.speaker_id = 45;  // zf_xiaobei 中文女声
+    tc.speed = cfg.tts_speed;
+    tc.pitch = cfg.tts_pitch;
+    tc.speaker_id = cfg.tts_speaker_id;
+    const std::string eng = detect_tts_engine(dir);
+    if (eng == "piper") {
+        // Piper(VITS)：<voice>.onnx + tokens.txt + espeak-ng-data
+        tc.engine = "piper";
+        tc.model_path = find_piper_onnx(dir);
+        tc.tokens_path = dir + "/tokens.txt";
+        tc.data_dir = dir + "/espeak-ng-data";
+    } else if (eng == "kokoro") {
+        // Kokoro：model.onnx + voices.bin + tokens.txt + espeak-ng-data
+        tc.engine = "kokoro";
+        tc.model_path = dir + "/model.onnx";
+        tc.voice_path = dir + "/voices.bin";
+        tc.tokens_path = dir + "/tokens.txt";
+        tc.data_dir = dir + "/espeak-ng-data";
+        tc.lexicon = dir + "/lexicon-zh.txt";
+    }
     return tc;
 }
 
@@ -256,6 +292,17 @@ void AgentController::setVadEnabled(bool enabled) {
     Task t;
     t.type = TaskType::SetVad;
     t.flag = enabled;
+    std::lock_guard<std::mutex> lk(mtx_);
+    queue_.push_back(std::move(t));
+    cv_.notify_all();
+}
+
+void AgentController::setTtsParams(double speed, double pitch, int speakerId) {
+    Task t;
+    t.type = TaskType::SetTtsParams;
+    t.d0 = speed;
+    t.d1 = pitch;
+    t.ival = speakerId;
     std::lock_guard<std::mutex> lk(mtx_);
     queue_.push_back(std::move(t));
     cv_.notify_all();
@@ -414,8 +461,8 @@ void AgentController::initCore_() {
                                   ? QStringLiteral("Whisper(真实)")
                                   : QStringLiteral("Mock(占位)")));
 
-        TTSConfig tc = kokoro_config(impl->cfg.tts_model);
-        tc.engine = impl->cfg.tts_engine;   // "simple"(默认,系统语音) / "kokoro"(模型)
+        TTSConfig tc = tts_config_for_dir(impl->cfg.tts_model, impl->cfg);
+        if (tc.engine.empty()) tc.engine = impl->cfg.tts_engine;  // 目录未识别 → 配置引擎
         emit loadStageChanged(++step, total, kInitStages[step - 1]);
         {
             auto t0 = std::chrono::steady_clock::now();
@@ -482,6 +529,7 @@ void AgentController::handleTask_(const Task& task) {
         case TaskType::PlayResponse: handlePlayResponse_(); break;
         case TaskType::RefreshLat:  handleRefreshLat_(); break;
         case TaskType::SetTts:      handleSetTts_(task.flag); break;
+        case TaskType::SetTtsParams: handleSetTtsParams_(task.d0, task.d1, task.ival); break;
         case TaskType::SetVad:      handleSetVad_(task.flag); break;
         case TaskType::ListMemory: handleListMemory_(); break;
         default: break;
@@ -490,6 +538,16 @@ void AgentController::handleTask_(const Task& task) {
 
 void AgentController::handleVoiceStart_() {
     if (!impl_ || !impl_->orch) return;
+    // 进入语音对讲前，先中断正在进行的文本链路播报（流式播报 / 手动"语音播报"按钮），
+    // 保证从各方开麦都能真正停声（重置后 handleText_ 会在下一轮按需重建）。
+    if (impl_->stream_speaker) {
+        impl_->stream_speaker->stop();
+        impl_->stream_speaker.reset();
+    }
+    if (impl_->speaker) {
+        impl_->speaker->stop();
+        impl_->speaker.reset();
+    }
     if (vad_enabled_.load()) {
         // VAD 模式：启动全双工监听，由 VAD 自动切分语音段
         if (listening_) return;
@@ -659,11 +717,16 @@ void AgentController::emitModelStatus_() {
             return {!impl_->cfg.vad_model.empty() && impl_->vad != nullptr,
                     std::string("Silero")};
         if (key == "ASR")
-            return {impl_->asr && impl_->asr->uses_real_backend(), "Whisper"};
-        if (impl_->tts)
+            return {impl_->asr && impl_->asr->uses_real_backend(),
+                    impl_->asr->backend_name()};
+        if (impl_->tts) {
+            const std::string eng = impl_->tts->engine_name();
             return {impl_->tts->uses_real_backend(),
-                    impl_->tts->simple_engine() ? "系统语音(SAPI)"
-                                                : std::string("Kokoro")};
+                    eng == "simple"   ? std::string("系统语音(SAPI)")
+                    : eng == "piper"  ? std::string("Piper")
+                    : eng == "kokoro" ? std::string("Kokoro")
+                                      : eng};
+        }
         return {false, "Mock"};
     };
 
@@ -735,6 +798,28 @@ void AgentController::handleSetTts_(bool enabled) {
                          : QStringLiteral("语音播报已关闭（文字回复正常）。"));
 }
 
+void AgentController::handleSetTtsParams_(double speed, double pitch, int speakerId) {
+    if (!impl_) return;
+    if (speed < 0.25) speed = 0.25;
+    if (speed > 2.0) speed = 2.0;
+    if (speakerId < 0) speakerId = 0;
+
+    impl_->cfg.tts_speed = static_cast<float>(speed);
+    impl_->cfg.tts_pitch = static_cast<float>(pitch);
+    impl_->cfg.tts_speaker_id = speakerId;
+
+    // 热更 TTS 实例（对后续合成立即生效；Kokoro 发音人 + 语速，SAPI 语速）
+    if (impl_->tts) {
+        impl_->tts->set_speed(static_cast<float>(speed));
+        impl_->tts->set_speaker_id(speakerId);
+    }
+
+    persistConfig_();
+    emit logLine(QStringLiteral("TTS 语音参数已更新：语速 %1 ×，发音人 #%2。")
+                     .arg(speed)
+                     .arg(speakerId));
+}
+
 void AgentController::handleSetVad_(bool enabled) {
     vad_enabled_.store(enabled);
     if (impl_ && impl_->orch) impl_->orch->set_vad_enabled(enabled);
@@ -750,18 +835,16 @@ void AgentController::persistConfig_() {
         std::ifstream in(path);
         std::string text((std::istreambuf_iterator<char>(in)),
                          std::istreambuf_iterator<char>());
-        // 仅当文件存在时改写模型路径条目
-        std::map<std::string, std::string> keys = {
-            {"vad_model", impl_->cfg.vad_model},
-            {"asr_model", impl_->cfg.asr_model},
-            {"tts_model", impl_->cfg.tts_model},
-            {"llm_model", impl_->cfg.llm_model},
-        };
+        // 仅当文件存在时改写模型路径条目；TTS 语音参数缺失则追加
         bool changed = false;
-        for (auto& [key, val] : keys) {
+        auto set_scalar = [&](const std::string& key, const std::string& val) {
             const std::string pat = key + ":";
             auto pos = text.find(pat);
-            if (pos == std::string::npos) continue;
+            if (pos == std::string::npos) {
+                text += "\n" + pat + " " + val;   // 缺失则该追加一行
+                changed = true;
+                return;
+            }
             auto lineEnd = text.find('\n', pos);
             if (lineEnd == std::string::npos) lineEnd = text.size();
             std::string line = text.substr(pos, lineEnd - pos);
@@ -770,11 +853,22 @@ void AgentController::persistConfig_() {
                 text.replace(pos, lineEnd - pos, newLine);
                 changed = true;
             }
-        }
+        };
+        std::map<std::string, std::string> keys = {
+            {"vad_model", impl_->cfg.vad_model},
+            {"asr_model", impl_->cfg.asr_model},
+            {"tts_model", impl_->cfg.tts_model},
+            {"llm_model", impl_->cfg.llm_model},
+            {"tts_engine", impl_->cfg.tts_engine},
+        };
+        for (auto& [key, val] : keys) set_scalar(key, val);
+        set_scalar("tts_speed", std::to_string(impl_->cfg.tts_speed));
+        set_scalar("tts_pitch", std::to_string(impl_->cfg.tts_pitch));
+        set_scalar("tts_speaker_id", std::to_string(impl_->cfg.tts_speaker_id));
         if (changed) {
             std::ofstream out(path, std::ios::trunc);
             out << text;
-            emit logLine("已保存模型配置到 configs/agent.yaml");
+            emit logLine("已保存配置到 configs/agent.yaml");
         }
     } catch (const std::exception& e) {
         emit logLine(QStringLiteral("保存配置失败：%1").arg(to_q(e.what())));
@@ -853,8 +947,8 @@ void AgentController::handleSetModels_(const ModelPaths& paths) {
 
         emit loadStageChanged(++step, total, kSwitchStages[step - 1]);
         auto tts = std::make_shared<TTS>();
-        TTSConfig tc = kokoro_config(ttsPath);
-        tc.engine = impl_->cfg.tts_engine;
+        TTSConfig tc = tts_config_for_dir(ttsPath, impl_->cfg);
+        if (tc.engine.empty()) tc.engine = impl_->cfg.tts_engine;
         {
             auto t0 = std::chrono::steady_clock::now();
             markModelLoading_("TTS", ttsPath);
@@ -863,8 +957,7 @@ void AgentController::handleSetModels_(const ModelPaths& paths) {
                 std::chrono::duration<double, std::milli>(
                     std::chrono::steady_clock::now() - t0).count());
         }
-        emit logLine(QStringLiteral("TTS后端：%1")
-                         .arg(to_q(tts->provider_label())));
+        emit logLine(QStringLiteral("TTS后端：%1").arg(to_q(tts->provider_label())));
 
         // 重建 Orchestrator（携带 agent + memory 挂载；音频管道沿用当前设备）
         emit loadStageChanged(++step, total, kSwitchStages[step - 1]);
@@ -889,6 +982,7 @@ void AgentController::handleSetModels_(const ModelPaths& paths) {
         if (!asrPath.empty()) impl_->cfg.asr_model = asrPath;
         if (!ttsPath.empty()) impl_->cfg.tts_model = ttsPath;
         if (!llmPath.empty()) impl_->cfg.llm_model = llmPath;
+        if (!tc.engine.empty()) impl_->cfg.tts_engine = tc.engine;  // 引擎随模型目录自动识别
         impl_->activeModels = paths;
         persistConfig_();
 

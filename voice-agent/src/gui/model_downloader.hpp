@@ -1,7 +1,10 @@
 // src/gui/model_downloader.hpp
 #pragma once
 #include <QObject>
+#include <QPair>
 #include <QString>
+#include <QUrl>
+#include <QVector>
 #include "gui/model_catalog.hpp"
 
 class QFile;
@@ -13,7 +16,8 @@ namespace gui {
 
 // ========== 模型下载器 ==========
 // 基于 Qt6::Network，支持 HTTPS、跳转、流式写盘与进度/错误上报。
-// 每次只下载一个模型：调用 start() 后，成功/失败均通过信号结束。
+// 每次只下载一个模型条目：主文件 + 附加文件顺序下载；
+// 需要时（extractTarBz2）用系统 tar 解压到目标目录。全部完成后才发 downloaded。
 class ModelDownloader final : public QObject {
     Q_OBJECT
 
@@ -31,20 +35,27 @@ public:
 
 signals:
     void progressChanged(int percent, qint64 bytesReceived, qint64 bytesTotal);
-    void statusChanged(const QString& text);           // 阶段文本（开始/校验/完成）
-    void downloaded(const QString& destRelPath);       // 下载完成（已落到 models/）
+    void statusChanged(const QString& text);           // 阶段文本（开始/校验/解压/完成）
+    void downloaded(const QString& destRelPath);       // 整个条目完成（含附加文件/解压）
     void downloadFailed(const ModelEntry& entry, const QString& error);
 
 private:
+    void startNext_();
     void handleFinished_();
     void writeChunk_();
+    void extractAndFinish_();
+    void finishOk_();
+    void fail_(const QString& error);
 
     QNetworkAccessManager* mgr_ = nullptr;
     QNetworkReply* reply_ = nullptr;
     QFile* file_ = nullptr;
     ModelEntry active_;
+    QVector<QPair<QUrl, QString>> queue_;  // (url, 相对 models/ 路径)
+    int queueIndex_ = -1;
     QString tempPath_;
     QString destAbsPath_;
+    qint64 totalBytes_ = 0;  // 已成功下载的累计字节（跨文件，用于整体进度）
     bool downloading_ = false;
 };
 

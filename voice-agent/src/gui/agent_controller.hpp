@@ -61,6 +61,10 @@ public:
     // 语音轮改为"按住说话/点击按钮录音，结束即转写"
     void setVadEnabled(bool enabled);
 
+    // 调节 TTS 语音参数：语速倍率 speed(0.25~2.0)、发音人 id(Kokoro)。
+    // 对后续合成即时生效，并持久化到 agent.yaml。async 在线程内处理。
+    void setTtsParams(double speed, double pitch, int speakerId);
+
     // 当前 VAD 开关状态
     bool vadEnabled() const { return vad_enabled_.load(); }
 
@@ -100,12 +104,15 @@ signals:
     void vadEnabledChanged(bool enabled);       // VAD 开关状态变化
 
 private:
-    enum class TaskType { StartVoice, StopVoice, SendText, SetModels, PlayResponse, RefreshLat, SetTts, SetVad, SetAudioDevice, ListMemory, Quit };
+    enum class TaskType { StartVoice, StopVoice, SendText, SetModels, PlayResponse, RefreshLat, SetTts, SetTtsParams, SetVad, SetAudioDevice, ListMemory, Quit };
     struct Task {
         TaskType type{TaskType::Quit};
         QString text;
         ModelPaths models;
         bool flag{true};
+        double d0{1.0};   // 语速倍率（SetTtsParams）
+        double d1{1.0};   // 音调倍率（保留）
+        int ival{45};     // 发音人 ID（SetTtsParams）
     };
 
     void threadMain_();
@@ -119,6 +126,7 @@ private:
     void handlePlayResponse_();
     void handleRefreshLat_();
     void handleSetTts_(bool enabled);
+    void handleSetTtsParams_(double speed, double pitch, int speakerId);
     void handleSetVad_(bool enabled);
     void handleListMemory_();
     void emitText_(const std::string& text);   // llmComplete + 记录最近回答

@@ -38,6 +38,20 @@ struct ASR::Impl {
                std::filesystem::exists(model_path + "/tokens.txt", ec);
     }
 
+    // Moonshine 目录：经典版 preprocessor+encoder+cached_decoder，或 v2 版 .ort 文件
+    static bool is_moonshine_dir(const std::string& model_path) {
+        if (model_path.empty()) return false;
+        std::error_code ec;
+        const bool classic =
+            std::filesystem::exists(model_path + "/preprocessor.onnx", ec) &&
+            std::filesystem::exists(model_path + "/encoder.onnx", ec) &&
+            std::filesystem::exists(model_path + "/tokens.txt", ec);
+        const bool v2 =
+            std::filesystem::exists(model_path + "/encoder_model.ort", ec) &&
+            std::filesystem::exists(model_path + "/decoder_model_merged.ort", ec);
+        return classic || v2;
+    }
+
     bool load_model(const ASRConfig& config) {
         // 1) sherpa-onnx Paraformer-zh / SenseVoice（中文优先，新默认）
         if (is_sherpa_dir(config.model_path)) {
@@ -50,6 +64,20 @@ struct ASR::Impl {
                 return true;
             }
             LOG_WARN("ASR: sherpa-onnx load failed ({}), falling back to whisper/mock",
+                     s->last_error());
+            // 继续尝试 Whisper
+        }
+        // 1.5) Moonshine（sherpa-onnx 离线，v2 量化包）
+        if (is_moonshine_dir(config.model_path)) {
+            auto s = std::make_unique<SherpaAsr>();
+            if (s->load(config.model_path, config.num_threads, config.provider)) {
+                sherpa = std::move(s);
+                sherpa_name = sherpa->model_name();
+                LOG_INFO("ASR: real Moonshine backend loaded ({}) from {}",
+                         sherpa_name, config.model_path);
+                return true;
+            }
+            LOG_WARN("ASR: Moonshine load failed ({}), falling back to whisper/mock",
                      s->last_error());
             // 继续尝试 Whisper
         }
@@ -200,6 +228,17 @@ std::string ASR::provider_label() const {
 #endif
 #ifdef USE_ONNXRUNTIME
     if (impl_ && impl_->whisper) return "CPU";  // Whisper ONNX 为纯 CPU 推理
+#endif
+    return "Mock";
+}
+
+std::string ASR::backend_name() const {
+#ifdef USE_SHERPAONNX
+    if (impl_ && impl_->sherpa)
+        return impl_->sherpa_name.empty() ? "sherpa-onnx" : impl_->sherpa_name;
+#endif
+#ifdef USE_ONNXRUNTIME
+    if (impl_ && impl_->whisper) return "whisper";
 #endif
     return "Mock";
 }

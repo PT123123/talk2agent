@@ -85,6 +85,7 @@ struct SapiSpeaker::Impl {
     std::condition_variable qcv;
     std::deque<Cmd> queue;
     bool quit{false};
+    std::atomic<bool> stop_req{false};   // stop() 请求：中断当前读本并丢弃后续
 
     std::thread worker;
 
@@ -92,6 +93,15 @@ struct SapiSpeaker::Impl {
     std::function<void()> done_cb;
     std::atomic<bool> speaking{false};
     std::wstring wide_voice_name;
+    std::atomic<float> rate_speed_{1.0f};   // 语速倍率（0.25~2.0）
+
+    // 语速倍率 → SAPI Rate（-10..10）：1.0 -> 0，上下各扩 10 档
+    static int sapi_rate(float speed) {
+        int r = static_cast<int>((speed - 1.0f) * 20.0f + 0.5f);
+        if (r < -10) r = -10;
+        if (r > 10) r = 10;
+        return r;
+    }
 
     // 工作线程：持有 COM + ISpVoice，串行执行命令
     void thread_main() {
@@ -148,39 +158,37 @@ struct SapiSpeaker::Impl {
                 voice->Speak(nullptr, SPF_PURGEBEFORESPEAK, nullptr);
                 speaking.store(false);
             } else if (!cmd.text.empty()) {
-                speaking.store(true);
-                voice->Speak(cmd.text.c_str(), SPF_ASYNC, nullptr);
+                // 关键：SAPI 的 Speak 会清空当前读本并替换（会打断上一句）。
+                // 因此每段必须"播放完才放下一段"——这里用同步 Speak 阻塞到本段播完。
+                speak_until_done_(voice, cmd.text);
             }
 
-            // 队列清空后：等待 SAPI 把已入队的异步读本播完，再回调"播报结束"
-            bool drained = false;
-            for (;;) {
-                bool empty_q = false;
-                {
-                    std::lock_guard<std::mutex> g(qmtx);
-                    empty_q = queue.empty();
-                }
-                if (!empty_q) { drained = false; break; }
-                if (!speaking.load()) { drained = true; break; }
-                if (voice->WaitUntilDone(50) == S_OK) {
-                    speaking.store(false);
-                    drained = true;
-                    break;
-                }
+            // 当前段已播完：触发"播报结束"回调（若期间有新段入队，则下一轮继续读）
+            std::function<void()> cb;
+            {
+                std::lock_guard<std::mutex> g(mtx);
+                cb = done_cb;
             }
-            if (drained) {
-                std::function<void()> cb;
-                {
-                    std::lock_guard<std::mutex> g(mtx);
-                    cb = done_cb;
-                }
-                if (cb) cb();
-            }
+            if (cb) cb();
         }
 
         voice->Speak(nullptr, SPF_PURGEBEFORESPEAK, nullptr);
         voice->Release();
         CoUninitialize();
+    }
+
+    // 同步朗读一段文本，阻塞到整段播完才返回（不会被打断，保证完整朗读）。
+    // stop() 置 stop_req 后，本段播完即停，后续已清空的队列不会再读。
+    void speak_until_done_(ISpVoice* voice, const std::wstring& text) {
+        if (text.empty()) return;
+        speaking.store(true);
+        if (stop_req.exchange(false)) {   // 若 stop() 已请求且队列清空，此处直接取消
+            speaking.store(false);
+            return;
+        }
+        voice->SetRate(sapi_rate(rate_speed_.load()));   // 热更语速
+        voice->Speak(text.c_str(), SPF_DEFAULT, nullptr);   // SPF_DEFAULT(0) = 同步阻塞
+        speaking.store(false);
     }
 };
 
@@ -215,11 +223,19 @@ void SapiSpeaker::speak(const std::string& utf8_text) {
 }
 
 void SapiSpeaker::stop() {
+    impl_->stop_req.store(true);
     {
         std::lock_guard<std::mutex> lk(impl_->qmtx);
-        impl_->queue.push_back(Cmd{CmdType::Purge, {}});
+        impl_->queue.clear();                                   // 丢弃尚未朗读的文本
+        impl_->queue.push_back(Cmd{CmdType::Purge, {}});        // 中断正在朗读的一段
     }
     impl_->qcv.notify_one();
+}
+
+void SapiSpeaker::set_rate(float speed) {
+    if (speed < 0.25f) speed = 0.25f;
+    if (speed > 2.0f) speed = 2.0f;
+    impl_->rate_speed_.store(speed);
 }
 
 bool SapiSpeaker::is_speaking() const {

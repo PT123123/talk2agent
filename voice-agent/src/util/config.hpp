@@ -186,6 +186,9 @@ inline AppConfig load_config(const std::string& path) {
     cfg.tts_model = j.value("tts_model", "models/tts/kokoro-multi-lang-v1_0");
     cfg.llm_model = j.value("llm_model", "models/qwen3-4b-q4_k_m.gguf");
     cfg.tts_engine = j.value("tts_engine", "simple");
+    cfg.tts_speed = j.value("tts_speed", 1.0f);
+    cfg.tts_pitch = j.value("tts_pitch", 1.0f);
+    cfg.tts_speaker_id = j.value("tts_speaker_id", 45);
 
     // 搜索
     if (j.contains("search")) {

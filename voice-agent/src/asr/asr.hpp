@@ -54,6 +54,9 @@ public:
     // 生效推理后端标签："DirectML GPU" / "CPU" / "Mock"
     std::string provider_label() const;
 
+    // 模型名："sense-voice" / "paraformer-zh" / "moonshine-zh" / "whisper" / "Mock"
+    std::string backend_name() const;
+
     // 设置识别结果回调
     void set_callback(ASRCallback callback);
 

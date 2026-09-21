@@ -36,6 +36,10 @@ public:
     // 中断当前朗读并清空 SAPI 队列。
     void stop();
 
+    // 设置语速（倍率 0.25~2.0，映射到 Windows SAPI 的 Rate 范围 -10~10）。
+    // 立即生效：之后朗读的文本按新语速播放。
+    void set_rate(float speed);
+
     // 是否正在朗读（队列非空或 SAPI 仍有活动读本）。
     bool is_speaking() const;
 

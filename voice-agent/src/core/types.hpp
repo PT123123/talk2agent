@@ -182,6 +182,11 @@ struct AppConfig {
     std::string llm_model;
     std::string tts_engine{"simple"};  // "simple"=系统语音(SAPI,默认)；"kokoro"=本地Kokoro模型
 
+    // TTS 语音参数（语速/音调/发音人）
+    float tts_speed{1.0f};        // 语速倍率（0.5~2.0）
+    float tts_pitch{1.0f};        // 音调倍率（保留字段，Kokoro 当前未参与生成）
+    int tts_speaker_id{45};       // 发音人 ID（Kokoro 多语言 45=zf_xiaobei 中文女声）
+
     // 搜索
     std::string searxng_url{"http://localhost:8080"};
     std::string tavily_key;

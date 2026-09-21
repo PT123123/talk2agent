@@ -15,14 +15,21 @@ QString modelCategoryName(ModelCategory c);
 QString modelCategoryConfigKey(ModelCategory c);
 
 // 一个可供下载的开源模型条目（URL 均经过人工核验）
+struct ModelFile {
+    QUrl url;            // 附加文件下载地址
+    QString destRelPath; // 相对 models/ 目录的保存路径
+};
+
 struct ModelEntry {
     ModelCategory category{ModelCategory::Llm};
     QString id;            // 唯一标识（用于排重 / 本地文件名）
     QString name;          // 展示名
     QString description;   // 一句话说明
-    QUrl url;              // 直接下载地址
-    QString destRelPath;   // 相对 models/ 目录的保存路径
-    qint64 sizeBytes{0};   // 大约字节数
+    QUrl url;              // 主文件直接下载地址
+    QString destRelPath;   // 主文件相对 models/ 目录的保存路径
+    std::vector<ModelFile> extraFiles; // 附加文件（多文件模型，顺序下载）
+    bool extractTarBz2{false}; // 主文件为 .tar.bz2，下载后解压到目标目录并删除压缩包
+    qint64 sizeBytes{0};   // 大约字节数（主文件 + 附加文件合计）
     QString sizeDisplay;   // 人类可读大小
 };
 

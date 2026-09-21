@@ -41,7 +41,7 @@ bool sentence_has_content(const std::string& s) {
 }
 
 // 判断多字节 UTF-8 序列尾部是否完整；返回需"保留在累积缓冲"的最小字节数。
-// 简单引擎按 token 直灌系统语音时，避免把一个中文字符切成两半。
+// （当前按句切分喂入，已不再需要；若未来恢复逐 token 直灌可复用。）
 size_t utf8_hold_back(const std::string& s) {
     if (s.empty()) return 0;
     size_t i = s.size();
@@ -241,14 +241,11 @@ void Orchestrator::on_vad_speech_start(uint64_t timestamp_us) {
     eou_detector_.on_speech_start(timestamp_us);
     smart_turn_.user_speech_start(timestamp_us);
 
-    // 如果 Agent 正在说话，评估打断意图
+    // 如果 Agent 正在说话，用户开麦即为打断：立即取消 LLM、停 TTS 与清空待播音频。
+    // （原先依赖 smart_turn 智能判断误判率高且打断动作从未真正触发——真正的
+    //   停止动作在 on_barge_in_detected/淡出回调，而 AudioRouter 从不触发淡出。）
     if (s == State::Speaking && smart_turn_.is_agent_speaking()) {
-        // 估算用户连续说话时长（简化：假设从用户开始说话到现在）
-        auto decision = smart_turn_.evaluate_barge_in(
-            static_cast<int>((timestamp_us - smart_turn_.is_agent_speaking() ? 0 : 0) / 1000), 0.0f);
-        if (decision == TurnDecision::AgentYield) {
-            enter_interrupting_();
-        }
+        interrupt_agent_();
     }
 }
 
@@ -282,6 +279,12 @@ void Orchestrator::begin_capture() {
 
     State s = state_.load();
     if (s == State::Idle || s == State::Listening) enter_listening_();
+
+    // 手动对讲（VAD 关闭）：Agent 正在播报时按下对讲同样视为打断，
+    // 立即停止当前 LLM 与语音播报，避免"界面已打断但声音仍在响"。
+    if (s == State::Speaking && smart_turn_.is_agent_speaking()) {
+        interrupt_agent_();
+    }
 }
 
 // 手动采集结束（VAD 关闭 / ASR 接管模式）：对讲松开时调用，整段提交转写
@@ -340,11 +343,15 @@ void Orchestrator::submit_segment_(std::vector<int16_t> seg) {
 }
 
 void Orchestrator::on_barge_in_detected() {
+    interrupt_agent_();
+}
+
+void Orchestrator::interrupt_agent_() {
     if (!running_.load()) return;
 
     LOG_WARN("Barge-in detected, interrupting agent");
 
-    // 取消当前 LLM 和 TTS
+    // 取消当前 LLM 和 TTS（真正的停声动作：中断合成、清空待播音频）
     if (session_token_) session_token_->cancel();
 
     if (llm_) llm_->stop();
@@ -541,43 +548,26 @@ void Orchestrator::on_llm_token_(const LLMResponse& chunk) {
             token_cb_(chunk.text);
         }
 
-        // 流式触发 TTS（边生成边合成）；开关关闭时跳过
+        // 流式触发 TTS（边生成边合成）；开关关闭时跳过。
+        // 无论引擎为何，都按"句级切分"喂入：累积到句子边界才交给 TTS/系统语音整句朗读。
+        // 注意不可逐 token 直灌——SAPI 一次 Speak 会清空当前读本，逐字喂会互相打断只读几字。
         if (tts_ && tts_enabled_.load() && state_.load() == State::Thinking) {
             tts_->set_cancel_token(session_token_);
             tts_accum_active_ = true;
 
-            if (tts_->simple_engine()) {
-                // ---- 简单引擎（系统语音）：token 一到就直灌，实现"出一个字念一个" ----
-                stream_sentence_ += chunk.text;
-                const size_t hold = utf8_hold_back(stream_sentence_);
-                if (hold < stream_sentence_.size()) {
-                    std::string ready = stream_sentence_.substr(0, stream_sentence_.size() - hold);
-                    stream_sentence_.erase(0, stream_sentence_.size() - hold);
-                    if (!ready.empty()) {
-                        const double t0 = now_ms();
-                        tts_->synthesize_stream(ready,
-                            [this](const int16_t* audio, size_t frames, bool is_last) {
-                                on_tts_chunk_(audio, frames, is_last);
-                            });
-                        tts_accum_ms_.store(tts_accum_ms_.load() + (now_ms() - t0));
-                    }
-                }
-            } else {
-                // ---- 模型（Kokoro）：句级切分，累积到句子边界才整句合成 ----
-                stream_sentence_ += chunk.text;
-                size_t cut = 0;
-                while ((cut = find_sentence_boundary(stream_sentence_)) != std::string::npos) {
-                    std::string sentence = stream_sentence_.substr(0, cut + 1);
-                    stream_sentence_.erase(0, cut + 1);
-                    // 纯空白/标点组成的空句跳过，避免无谓的单字符合成
-                    if (sentence_has_content(sentence)) {
-                        const double t0 = now_ms();
-                        tts_->synthesize_stream(sentence,
-                            [this](const int16_t* audio, size_t frames, bool is_last) {
-                                on_tts_chunk_(audio, frames, is_last);
-                            });
-                        tts_accum_ms_.store(tts_accum_ms_.load() + (now_ms() - t0));
-                    }
+            stream_sentence_ += chunk.text;
+            size_t cut = 0;
+            while ((cut = find_sentence_boundary(stream_sentence_)) != std::string::npos) {
+                std::string sentence = stream_sentence_.substr(0, cut + 1);
+                stream_sentence_.erase(0, cut + 1);
+                // 纯空白/标点组成的空句跳过，避免无谓的单字符合成
+                if (sentence_has_content(sentence)) {
+                    const double t0 = now_ms();
+                    tts_->synthesize_stream(sentence,
+                        [this](const int16_t* audio, size_t frames, bool is_last) {
+                            on_tts_chunk_(audio, frames, is_last);
+                        });
+                    tts_accum_ms_.store(tts_accum_ms_.load() + (now_ms() - t0));
                 }
             }
         }

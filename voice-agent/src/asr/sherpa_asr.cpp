@@ -45,6 +45,13 @@ bool SherpaAsr::load(const std::string& model_dir, int num_threads,
         return s;
     }();
     const bool is_sense = lower.find("sense") != std::string::npos;
+    const bool is_moonshine_classic =
+        file_exists(model_dir + "/preprocessor.onnx") &&
+        file_exists(model_dir + "/encoder.onnx");
+    const bool is_moonshine_v2 =
+        file_exists(model_dir + "/encoder_model.ort") &&
+        file_exists(model_dir + "/decoder_model_merged.ort");
+    const bool is_moonshine = is_moonshine_classic || is_moonshine_v2;
 
     // provider: auto → 运行时支持 DirectML 就用 GPU，否则 CPU
     std::string prov = provider;
@@ -54,6 +61,12 @@ bool SherpaAsr::load(const std::string& model_dir, int num_threads,
         prov = "cpu";
     }
     const bool use_gpu = (prov == "dml");
+
+    // Moonshine 为 int8/.ort 量化模型，DirectML 反量化过慢且 .ort 兼容性差，固定 CPU
+    if (is_moonshine && prov == "dml") {
+        LOG_WARN("SherpaAsr: Moonshine 量化模型走 CPU（DirectML 不适用）");
+        prov = "cpu";
+    }
 
     // 模型选择：GPU 优先 fp32（int8 在 DirectML 上需逐层反量化，实测慢约 20 倍）；
     // CPU 优先 int8（体积小、速度快）
@@ -70,7 +83,14 @@ bool SherpaAsr::load(const std::string& model_dir, int num_threads,
         prov = "cpu";
     }
     const std::string tokens = model_dir + "/tokens.txt";
-    if (!file_exists(model) || !file_exists(tokens)) {
+    if (is_moonshine) {
+        if ((is_moonshine_classic && !file_exists(model_dir + "/cached_decoder.onnx")) ||
+            !file_exists(tokens)) {
+            error_ = "missing moonshine files/tokens in " + model_dir;
+            LOG_ERROR("SherpaAsr: {}", error_);
+            return false;
+        }
+    } else if (!file_exists(model) || !file_exists(tokens)) {
         error_ = "missing model/tokens in " + model_dir;
         LOG_ERROR("SherpaAsr: {}", error_);
         return false;
@@ -94,7 +114,26 @@ bool SherpaAsr::load(const std::string& model_dir, int num_threads,
     c.model_config.tokens = tokens.c_str();
     c.decoding_method = "greedy_search";
 
-    if (is_sense) {
+    if (is_moonshine) {
+        if (is_moonshine_v2) {
+            // v2 版：encoder_model.ort + decoder_model_merged.ort
+            const std::string enc = model_dir + "/encoder_model.ort";
+            const std::string dec = model_dir + "/decoder_model_merged.ort";
+            c.model_config.moonshine.encoder = enc.c_str();
+            c.model_config.moonshine.merged_decoder = dec.c_str();
+        } else {
+            // 经典版：preprocessor + encoder + cached/uncached decoder
+            const std::string pre = model_dir + "/preprocessor.onnx";
+            const std::string enc = model_dir + "/encoder.onnx";
+            const std::string unc = model_dir + "/uncached_decoder.onnx";
+            const std::string cac = model_dir + "/cached_decoder.onnx";
+            c.model_config.moonshine.preprocessor = pre.c_str();
+            c.model_config.moonshine.encoder = enc.c_str();
+            c.model_config.moonshine.uncached_decoder = unc.c_str();
+            c.model_config.moonshine.cached_decoder = cac.c_str();
+        }
+        name_ = "moonshine-zh";
+    } else if (is_sense) {
         c.model_config.sense_voice.model = model.c_str();
         c.model_config.sense_voice.language = "zh";
         c.model_config.sense_voice.use_itn = 1;

@@ -12,6 +12,8 @@
 #include <QLabel>
 #include <QProgressBar>
 #include <QPushButton>
+#include <QSlider>
+#include <QSpinBox>
 #include <QTimer>
 #include <QVBoxLayout>
 
@@ -166,6 +168,56 @@ void SettingsPanel::buildBehaviorTab_() {
     hint->setWordWrap(true);
     hint->setStyleSheet(QStringLiteral("color:#555;"));
     lay->addWidget(hint);
+
+    // ---- TTS 语音参数：语速 / 发音人 ----
+    auto* ttsBox = new QGroupBox(QStringLiteral("语音播报（TTS）"), page);
+    auto* tg = new QGridLayout(ttsBox);
+    tg->setContentsMargins(10, 10, 10, 10);
+
+    tg->addWidget(new QLabel(QStringLiteral("语速"), ttsBox), 0, 0);
+    ttsSpeedSlider_ = new QSlider(Qt::Horizontal, ttsBox);
+    ttsSpeedSlider_->setRange(50, 200);        // 0.50× ~ 2.00×
+    ttsSpeedSlider_->setValue(100);
+    ttsSpeedSlider_->setTickInterval(10);
+    ttsSpeedSlider_->setTickPosition(QSlider::TicksBelow);
+    tg->addWidget(ttsSpeedSlider_, 0, 1);
+    ttsSpeedValue_ = new QLabel(QStringLiteral("1.00×"), ttsBox);
+    ttsSpeedValue_->setMinimumWidth(56);
+    ttsSpeedValue_->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+    tg->addWidget(ttsSpeedValue_, 0, 2);
+
+    tg->addWidget(new QLabel(QStringLiteral("发音人"), ttsBox), 1, 0);
+    ttsSpeakerSpin_ = new QSpinBox(ttsBox);
+    ttsSpeakerSpin_->setRange(0, 200);
+    ttsSpeakerSpin_->setValue(45);
+    ttsSpeakerSpin_->setToolTip(QStringLiteral(
+        "Kokoro 多语言发音人 ID（45=中文女声）。SAPI 用系统默认语音，此项无效。"));
+    tg->addWidget(ttsSpeakerSpin_, 1, 1, 1, 2);
+
+    auto* note = new QLabel(QStringLiteral(
+        "• 语速：SAPI / Kokoro 均生效\n"
+        "• 发音人：仅 Kokoro 模型生效，SAPI 使用系统默认中文语音"),
+        ttsBox);
+    note->setWordWrap(true);
+    note->setStyleSheet(QStringLiteral("color:#888;"));
+    tg->addWidget(note, 2, 0, 1, 3);
+
+    auto* ttsApply = new QPushButton(QStringLiteral("应用语音参数"), ttsBox);
+    ttsApply->setStyleSheet(QStringLiteral(
+        "background:#1a73e8;color:#fff;padding:6px 16px;border-radius:4px;"));
+    tg->addWidget(ttsApply, 3, 0, 1, 3);
+
+    connect(ttsSpeedSlider_, &QSlider::valueChanged, this, [this](int v) {
+        if (ttsSpeedValue_)
+            ttsSpeedValue_->setText(
+                QStringLiteral("%1×").arg(v / 100.0, 0, 'f', 2));
+    });
+    connect(ttsApply, &QPushButton::clicked, this, [this] {
+        emit ttsParamsApplied(ttsSpeedSlider_->value() / 100.0, 1.0,
+                              ttsSpeakerSpin_->value());
+    });
+
+    lay->addWidget(ttsBox);
     lay->addStretch(1);
 
     innerTabs_->addTab(page, QStringLiteral("播报与交互"));

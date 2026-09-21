@@ -10,6 +10,8 @@ class QProgressBar;
 class QPushButton;
 class QGridLayout;
 class QTabWidget;
+class QSlider;
+class QSpinBox;
 
 namespace voice_agent {
 namespace gui {
@@ -41,6 +43,7 @@ public:
 signals:
     void modelsApplied(const ModelPaths& paths);   // 用户点击“应用切换”
     void audioDeviceApplied(const QString& deviceName); // 应用麦克风设备（空 = 默认）
+    void ttsParamsApplied(double speed, double pitch, int speakerId); // 应用 TTS 语速/发音人
 
 public slots:
     // 由外部定时刷新输入电平（dBFS）
@@ -79,6 +82,11 @@ private:
     QLabel* micStatus_ = nullptr;
     QProgressBar* levelBar_ = nullptr;
     QLabel* levelLabel_ = nullptr;
+
+    // TTS 语音参数子页（语速滑块 / 发音人数值）
+    QSlider* ttsSpeedSlider_ = nullptr;
+    QLabel* ttsSpeedValue_ = nullptr;
+    QSpinBox* ttsSpeakerSpin_ = nullptr;
 };
 
 }  // namespace voice_agent::gui

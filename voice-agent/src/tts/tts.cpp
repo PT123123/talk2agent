@@ -45,30 +45,42 @@ struct TTS::Impl {
 
         SherpaOnnxOfflineTtsConfig c;
         memset(&c, 0, sizeof(c));
-        c.model.kokoro.model = config.model_path.c_str();
-        if (!config.voice_path.empty())
-            c.model.kokoro.voices = config.voice_path.c_str();
-        if (!config.tokens_path.empty())
-            c.model.kokoro.tokens = config.tokens_path.c_str();
-        if (!config.data_dir.empty())
-            c.model.kokoro.data_dir = config.data_dir.c_str();
-        if (!config.lexicon.empty())
-            c.model.kokoro.lexicon = config.lexicon.c_str();
-        c.model.kokoro.length_scale = 1.0f / std::max(0.25f, config.speed);
         c.model.num_threads = 2;
         c.model.debug = 0;
         c.model.provider = p.c_str();
         c.max_num_sentences = 2;
 
+        if (config.engine == "piper") {
+            // Piper(VITS)：<onnx> + tokens.txt + espeak-ng-data
+            c.model.vits.model = config.model_path.c_str();
+            c.model.vits.tokens = config.tokens_path.c_str();
+            c.model.vits.data_dir = config.data_dir.c_str();
+            c.model.vits.length_scale = std::max(0.25f, config.speed);
+            c.model.vits.noise_scale = 0.667f;
+            c.model.vits.noise_scale_w = 0.8f;
+        } else {
+            // Kokoro
+            c.model.kokoro.model = config.model_path.c_str();
+            if (!config.voice_path.empty())
+                c.model.kokoro.voices = config.voice_path.c_str();
+            if (!config.tokens_path.empty())
+                c.model.kokoro.tokens = config.tokens_path.c_str();
+            if (!config.data_dir.empty())
+                c.model.kokoro.data_dir = config.data_dir.c_str();
+            if (!config.lexicon.empty())
+                c.model.kokoro.lexicon = config.lexicon.c_str();
+            c.model.kokoro.length_scale = 1.0f / std::max(0.25f, config.speed);
+        }
+
         tts_ = SherpaOnnxCreateOfflineTts(&c);
         if (!tts_) {
-            LOG_ERROR("KokoroTTS: failed to create engine ({})", config.model_path);
+            LOG_ERROR("{}TTS: failed to create engine ({})", config.engine, config.model_path);
             return false;
         }
         provider_ = p;
         sample_rate_ = SherpaOnnxOfflineTtsSampleRate(tts_);
-        LOG_INFO("KokoroTTS: engine ready, sample_rate={}, speakers={}, provider={}",
-                 sample_rate_, SherpaOnnxOfflineTtsNumSpeakers(tts_), prov);
+        LOG_INFO("{}TTS: engine ready, sample_rate={}, speakers={}, provider={}",
+                 config.engine, sample_rate_, SherpaOnnxOfflineTtsNumSpeakers(tts_), prov);
         return true;
     }
 #endif
@@ -113,16 +125,23 @@ struct TTS::Impl {
 #ifdef USE_SHERPAONNX
         // provider: auto → 运行时支持 DirectML 就用 GPU，否则 CPU
         std::string prov = config.provider;
-        if (prov == "auto") prov = ort_dml_available() ? "dml" : "cpu";
-        if (prov == "dml" && !ort_dml_available()) {
-            LOG_WARN("KokoroTTS: provider=dml 但运行时无 DirectML 支持，回退 cpu");
+        if (config.engine == "piper") {
+            // Piper(VITS) 固定 CPU：Intel Arc DirectML 对 grouped ConvTranspose 有已知崩溃，
+            // 与 Kokoro 相同规避策略；且 Piper 体积小，CPU 已可实时合成。
+            LOG_INFO("PiperTTS: 固定 CPU 推理（DirectML 兼容性考虑）");
             prov = "cpu";
-        }
-        // Intel 显卡 + DirectML 对 Kokoro 的 grouped ConvTranspose 会直接崩溃（0xC0000409），
-        // 无法运行时捕获，只能在启动时规避：Intel 适配器默认走 CPU。
-        if (prov == "dml" && ort_dml_intel_adapter()) {
-            LOG_WARN("KokoroTTS: 检测到 Intel 显卡，DirectML 对 Kokoro 存在已知崩溃，回退 cpu");
-            prov = "cpu";
+        } else {
+            if (prov == "auto") prov = ort_dml_available() ? "dml" : "cpu";
+            if (prov == "dml" && !ort_dml_available()) {
+                LOG_WARN("KokoroTTS: provider=dml 但运行时无 DirectML 支持，回退 cpu");
+                prov = "cpu";
+            }
+            // Intel 显卡 + DirectML 对 Kokoro 的 grouped ConvTranspose 会直接崩溃（0xC0000409），
+            // 无法运行时捕获，只能在启动时规避：Intel 适配器默认走 CPU。
+            if (prov == "dml" && ort_dml_intel_adapter()) {
+                LOG_WARN("KokoroTTS: 检测到 Intel 显卡，DirectML 对 Kokoro 存在已知崩溃，回退 cpu");
+                prov = "cpu";
+            }
         }
         return create_engine(config, prov);
 #else
@@ -274,6 +293,18 @@ void TTS::stop() {
 
 void TTS::set_cancel_token(std::shared_ptr<CancelToken> token) {
     cancel_token_ = std::move(token);
+}
+
+void TTS::set_speed(float speed) {
+    if (speed < 0.25f) speed = 0.25f;
+    if (speed > 2.0f) speed = 2.0f;
+    config_.speed = speed;                       // Kokoro 后续合成立即按新语速
+    if (impl_ && impl_->sapi) impl_->sapi->set_rate(speed);   // SAPI 同步映射
+}
+
+void TTS::set_speaker_id(int id) {
+    if (id < 0) id = 0;
+    config_.speaker_id = id;                     // Kokoro 后续合成立即切换发音人
 }
 
 void TTS::set_speech_done_callback(std::function<void()> cb) {

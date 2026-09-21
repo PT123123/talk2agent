@@ -13,10 +13,11 @@ class SapiSpeaker;
 
 // TTS 配置
 struct TTSConfig {
-    std::string engine = "simple";  // "simple"=Windows 系统语音(SAPI，免模型/流式默认)；"kokoro"=本地 Kokoro 模型
-    std::string model_path;      // 模型路径（Kokoro: model.onnx）
+    std::string engine = "simple";  // "simple"=Windows 系统语音(SAPI，免模型/流式默认)；
+                                    // "kokoro"=本地 Kokoro 模型；"piper"=本地 Piper(VITS) 模型
+    std::string model_path;      // 模型路径（Kokoro: model.onnx；Piper: <voice>.onnx）
     std::string voice_path;       // 音色路径（Kokoro: voices.bin）
-    std::string tokens_path;      // token 表（Kokoro: tokens.txt）
+    std::string tokens_path;      // token 表（Kokoro/Piper: tokens.txt）
     std::string data_dir;         // espeak-ng-data 目录
     std::string lexicon;          // 可选词典（Kokoro: lexicon-zh.txt）
     int speaker_id = 45;          // 发音人 ID（Kokoro 多语言：45=zf_xiaobei 中文女声）
@@ -57,6 +58,9 @@ public:
     // 是否使用"简单引擎"（Windows 系统语音 SAPI，免模型、实时流式）
     bool simple_engine() const { return simple_engine_; }
 
+    // 当前引擎名："simple" / "kokoro" / "piper"
+    std::string engine_name() const { return config_.engine; }
+
     // 简单引擎模式下，朗读结束回调（SAPI 播完一段后触发一次，用于驱动状态机）
     void set_speech_done_callback(std::function<void()> cb);
 
@@ -71,6 +75,13 @@ public:
 
     // 获取配置
     const TTSConfig& config() const { return config_; }
+
+    // 动态调整语速（倍率，0.25~2.0）。简单引擎(SAPI)同步映射语速并即时生效；
+    // Kokoro 对后续合成立即生效（无需重建引擎）。
+    void set_speed(float speed);
+
+    // 动态切换发音人 ID（Kokoro 生效；简单引擎忽略）。
+    void set_speaker_id(int id);
 
     // 最近一次合成耗时（毫秒，供调试面板轮询）
     std::atomic<double> last_synthesize_ms{0.0};

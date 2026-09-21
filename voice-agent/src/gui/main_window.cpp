@@ -435,6 +435,10 @@ void MainWindow::connectSignals_() {
     connect(settings_, &SettingsPanel::audioDeviceApplied, controller_,
             &AgentController::setAudioDevice);
 
+    // 设置页 → TTS 语速/发音人（跨线程投递到 worker 处置并持久化）
+    connect(settings_, &SettingsPanel::ttsParamsApplied, controller_,
+            &AgentController::setTtsParams);
+
     // 麦克风输入电平 → 调试面板（80ms 轮询 atomic，开销可忽略）
     levelTimer_ = new QTimer(this);
     levelTimer_->setInterval(80);

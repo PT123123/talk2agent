@@ -160,6 +160,10 @@ private:
     void enter_speaking_();
     void enter_interrupting_();
 
+    // 真正执行打断：取消当前 LLM、中断 TTS 合成与播放、清空待播音频，
+    // 并切回 Listening。供 VAD 检测打断、手动对讲(begin_capture)与淡出回调共用。
+    void interrupt_agent_();
+
     // ========== 管道操作 ==========
     void start_capture_();
     void stop_capture_();
