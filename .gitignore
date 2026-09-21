@@ -39,3 +39,12 @@ voice-agent/data/
 **/sherpa-onnx-dml/
 # sherpa-onnx FetchContent 源码（CMake 自动获取，勿提交为 gitlink）
 **/sherpa-onnx-src/
+
+# 编译产物/三方二进制（DLL/LIB/PDB 等超大文件，勿提交；构建时由 CMake 获取）
+**/*.pdb
+**/*.dll
+**/*.lib
+**/*.obj
+**/*.exe
+**/*.o
+**/*.a
