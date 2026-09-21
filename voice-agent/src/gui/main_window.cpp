@@ -328,6 +328,9 @@ void MainWindow::connectSignals_() {
             controller_, &AgentController::refreshLatencies);
     connect(controller_, &AgentController::latencySnapshot,
             settings_->latencyPanel(), &LatencyPanel::onLatencySnapshot);
+    // 每轮完成 → 反馈记录 + 瓶颈判定 + 调整建议（仅记录，不自动应用）
+    connect(controller_, &AgentController::turnTimeline,
+            settings_->latencyPanel(), &LatencyPanel::onTurnFeedback);
 
     connect(controller_, &AgentController::userMessage, this, &MainWindow::onUserMessage_);
     connect(controller_, &AgentController::llmToken, this, &MainWindow::appendToken_);
