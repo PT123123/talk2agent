@@ -1,6 +1,12 @@
 # tests/CMakeLists.txt
 cmake_minimum_required(VERSION 3.20)
 
+# 诊断：ENABLE_ASAN 时测试目标与 voice_agent_core 保持同样的插桩（否则 LNK2038）
+if(ENABLE_ASAN)
+    add_compile_options(/fsanitize=address)
+    add_link_options(/INFERASANLIBS /INCREMENTAL:NO)
+endif()
+
 # 运行时 DLL 搜索路径：llama/ggml（${CMAKE_BINARY_DIR}/bin）、spdlog、onnxruntime 等
 # 由 FetchContent 生成的 DLL 不在系统 PATH 中，ctest 直接运行 exe 会 0xc0000135。
 if(WIN32)
@@ -71,6 +77,74 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/test_memory.cpp)
     add_test(NAME test_memory COMMAND test_memory)
     voice_agent_test_env(test_memory)
     voice_agent_test_copy_rt(test_memory)
+endif()
+
+# R0 Conversation Runtime 测试（Task 生命周期 / WorkingContext / Policy / Intent）
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/test_runtime.cpp)
+    add_executable(test_runtime test_runtime.cpp)
+    target_link_libraries(test_runtime PRIVATE voice_agent_core)
+    add_test(NAME test_runtime COMMAND test_runtime)
+    voice_agent_test_env(test_runtime)
+    voice_agent_test_copy_rt(test_runtime)
+endif()
+
+# R1 轮次准入测试（意图 / Policy / 换话题 / supersede 触发）
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/test_turn_admission.cpp)
+    add_executable(test_turn_admission test_turn_admission.cpp)
+    target_link_libraries(test_turn_admission PRIVATE voice_agent_core)
+    add_test(NAME test_turn_admission COMMAND test_turn_admission)
+    voice_agent_test_env(test_turn_admission)
+    voice_agent_test_copy_rt(test_turn_admission)
+endif()
+
+# R3 Fast Response + BackgroundCache 测试
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/test_fast_response.cpp)
+    add_executable(test_fast_response test_fast_response.cpp)
+    target_link_libraries(test_fast_response PRIVATE voice_agent_core)
+    add_test(NAME test_fast_response COMMAND test_fast_response)
+    voice_agent_test_env(test_fast_response)
+    voice_agent_test_copy_rt(test_fast_response)
+endif()
+
+# R4 Model Router 测试（分档参数 / 降级 / 统计）
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/test_model_router.cpp)
+    add_executable(test_model_router test_model_router.cpp)
+    target_link_libraries(test_model_router PRIVATE voice_agent_core)
+    add_test(NAME test_model_router COMMAND test_model_router)
+    voice_agent_test_env(test_model_router)
+    voice_agent_test_copy_rt(test_model_router)
+endif()
+
+# R8 长跑稳定性测试（内存红线 / 线程泄漏 / 容器容量）
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/test_long_run.cpp)
+    add_executable(test_long_run test_long_run.cpp)
+    target_link_libraries(test_long_run PRIVATE voice_agent_core)
+    # 读进程工作集需要 psapi
+    target_link_libraries(test_long_run PRIVATE psapi)
+    add_test(NAME test_long_run COMMAND test_long_run)
+    voice_agent_test_env(test_long_run)
+    voice_agent_test_copy_rt(test_long_run)
+    set_tests_properties(test_long_run PROPERTIES
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+        TIMEOUT 300)
+endif()
+
+# R6 Prosody / ResponsePlan 测试
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/test_prosody.cpp)
+    add_executable(test_prosody test_prosody.cpp)
+    target_link_libraries(test_prosody PRIVATE voice_agent_core)
+    add_test(NAME test_prosody COMMAND test_prosody)
+    voice_agent_test_env(test_prosody)
+    voice_agent_test_copy_rt(test_prosody)
+endif()
+
+# R7 远程 LLM 测试（OpenAI 兼容协议 / SSE 解析 / 路由降级；不联网）
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/test_remote_llm.cpp)
+    add_executable(test_remote_llm test_remote_llm.cpp)
+    target_link_libraries(test_remote_llm PRIVATE voice_agent_core)
+    add_test(NAME test_remote_llm COMMAND test_remote_llm)
+    voice_agent_test_env(test_remote_llm)
+    voice_agent_test_copy_rt(test_remote_llm)
 endif()
 
 # 临时 probe：隔离 validate_tool_args_json

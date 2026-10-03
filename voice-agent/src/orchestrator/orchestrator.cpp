@@ -1,6 +1,7 @@
 // src/orchestrator/orchestrator.cpp
 #include "orchestrator.hpp"
 #include "util/log.hpp"
+#include "orchestrator/model_engines.hpp"
 #include <cctype>
 #include <cstring>
 #include <chrono>
@@ -14,18 +15,10 @@ inline double now_ms() {
         .count();
 }
 
-// 找到第一个"句子结束"标点（用于把 LLM 流式文本切成可整句合成的块）。
-// 支持中英标点与换行；找不到返回 npos。返回下标（含该标点）。
-size_t find_sentence_boundary(const std::string& s) {
-    for (size_t i = 0; i < s.size(); ++i) {
-        const char c = s[i];
-        if (c == '。' || c == '！' || c == '？' || c == '；' ||
-            c == '!' || c == '?' || c == ';' || c == '\n' ||
-            c == '…') {
-            return i;
-        }
-    }
-    return std::string::npos;
+inline int64_t now_ns() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
 }
 
 // 句子内是否含非空白/标点的实际内容（排除纯符号/空白片段）
@@ -39,27 +32,9 @@ bool sentence_has_content(const std::string& s) {
     }
     return false;
 }
-
-// 判断多字节 UTF-8 序列尾部是否完整；返回需"保留在累积缓冲"的最小字节数。
-// （当前按句切分喂入，已不再需要；若未来恢复逐 token 直灌可复用。）
-size_t utf8_hold_back(const std::string& s) {
-    if (s.empty()) return 0;
-    size_t i = s.size();
-    int cont = 0;
-    size_t need = 0;
-    for (; i > 0; --i) {
-        unsigned char c = static_cast<unsigned char>(s[i - 1]);
-        if ((c & 0xC0) == 0x80) { ++cont; continue; }
-        if ((c & 0x80) == 0) return 0;
-        if ((c & 0xE0) == 0xC0) need = 2;
-        else if ((c & 0xF0) == 0xE0) need = 3;
-        else if ((c & 0xF8) == 0xF0) need = 4;
-        else need = 1;
-        break;
-    }
-    size_t have = s.size() - (i - 1);
-    return (have >= need) ? 0 : need - have;
-}
+// 注：原先的 find_sentence_boundary() 与 utf8_hold_back() 已移除 ——
+// 句级切分统一由 ProsodyPlanner::split_sentences 负责（它还处理
+// 连续标点合并、纯标点段丢弃、超长文本二次切分），两处实现并存必然漂移。
 }  // namespace
 
 // ========== 构造函数 / 析构函数 ==========
@@ -74,7 +49,35 @@ Orchestrator::Orchestrator(Config config)
           config.barge_in_min_ms,
           config.backchannel_max_ms,
           0.6f})
+    , tasks_(std::max(1, config.runtime_workers))
+    , admission_(TurnAdmissionConfig{
+          /*enable_response_policy*/config.enable_response_policy,
+          /*enable_topic_supersede*/config.enable_topic_supersede,
+          /*agent_speaking*/false},
+          &context_.working())   // 与 ContextManager 共享同一份 WorkingContext
+    , fast_response_(FastResponseLayer::Config{
+          /*enabled*/config.enable_fast_response,
+          /*ack_threshold_ms*/config.ack_threshold_ms > 0
+                                ? config.ack_threshold_ms : 700,
+          /*default_estimate_ms*/600,
+          /*max_acks_per_task*/1,
+          /*ewma_alpha*/0.3})
 {
+    // 后台任务结果一律入 cache / WorkingContext，绝不主动抢话播报。
+    // 播报与否由上层按 turn 上下文决定 —— 这里只负责"结果有地方放"。
+    tasks_.set_result_sink([this](const TaskId& id, const TaskOutcome& outcome) {
+        absorb_background_result_(id, outcome);
+    });
+
+    // R6：TTS 适配器。SAPI 与模型引擎的参数能力不同，映射方式也不同。
+    // 引擎在 initialize() 时才知道，故先建一个默认的（模型引擎），
+    // initialize() 会按实际引擎重建。
+    tts_adapter_ = std::make_shared<ModelTtsAdapter>(nullptr);
+
+    // R8：trace 写盘器。路径为空则关闭（零开销）。
+    if (!config_.trace_path.empty()) {
+        trace_writer_ = std::make_unique<VoiceTraceWriter>(config_.trace_path, true);
+    }
 }
 
 Orchestrator::~Orchestrator() {
@@ -114,8 +117,70 @@ bool Orchestrator::initialize(
     });
     audio_router_.set_fade_out_ms(config_.fade_out_ms);
 
+    // R4：把现有 LLM 包装成引擎注册到各档位。
+    // 同一个本地模型可以服务多档 —— 靠采样参数区分（详见 ModelRouter）。
+    // 这样"不把所有问题路由到最大模型"就能落地：简单问题用低温度+短输出，
+    // 复杂推理才放开长度。
+    if (llm_) {
+        auto engine = std::make_shared<LocalLlamaEngine>(llm_, /*supports_tools=*/true);
+        // 用数组而非花括号列表：MSVC 对 range-for 的花括号列表
+        // 在某些包含级别下会报 "is not a class or namespace name"。
+        const ModelTier tiers[] = {
+            ModelTier::Fast, ModelTier::Normal, ModelTier::Deep,
+            ModelTier::Agent, ModelTier::Search, ModelTier::Background
+        };
+        for (ModelTier t : tiers) {
+            model_router_.register_engine(t, engine);
+        }
+    }
+
+    // R6：按实际引擎建 TTS 适配器 —— SAPI 的参数能力与 Kokoro 不同。
+    if (tts_) {
+        tts_adapter_ = tts_->simple_engine()
+                           ? std::static_pointer_cast<ITtsAdapter>(
+                                 std::make_shared<SapiTtsAdapter>(tts_.get()))
+                           : std::static_pointer_cast<ITtsAdapter>(
+                                 std::make_shared<ModelTtsAdapter>(tts_.get()));
+        LOG_INFO("TTS adapter: {} (full prosody={})",
+                 tts_adapter_->name(),
+                 tts_adapter_->supports_full_prosody() ? "yes" : "no");
+    }
+
     LOG_INFO("Orchestrator initialized");
     return true;
+}
+
+void Orchestrator::register_model_engine(ModelTier tier,
+                                         std::shared_ptr<IModelEngine> engine) {
+    model_router_.register_engine(tier, std::move(engine));
+}
+
+void Orchestrator::attach_remote_llm(const RemoteLLMConfig& cfg,
+                                     const std::vector<ModelTier>& tiers) {
+    if (cfg.base_url.empty() || cfg.model.empty()) {
+        LOG_INFO("Remote LLM not attached (empty base_url or model) - "
+                 "DEEP tier stays local");
+        return;
+    }
+    remote_ = std::make_shared<RemoteLLM>(cfg);
+    if (!remote_->available()) {
+        LOG_WARN("Remote LLM not available after construction");
+        remote_.reset();
+        return;
+    }
+    for (ModelTier t : tiers) {
+        model_router_.register_engine(t, remote_);
+    }
+    LOG_INFO("Remote LLM attached: {} model={} tiers=[{}]",
+             remote_->name(), cfg.model,
+             [&] {
+                 std::string s;
+                 for (auto t : tiers) {
+                     if (!s.empty()) s += ",";
+                     s += model_tier_to_string(t);
+                 }
+                 return s;
+             }());
 }
 
 // ========== 生命周期 ==========
@@ -124,6 +189,7 @@ void Orchestrator::start() {
     if (running_.exchange(true)) return;
 
     session_token_ = std::make_shared<CancelToken>();
+    tasks_.start();   // R1：后台任务池（可重复 start，幂等）
 
     // 注册 VAD 回调
     if (vad_) {
@@ -189,6 +255,18 @@ void Orchestrator::start() {
 
     enter_idle_();
     LOG_INFO("Orchestrator started");
+    LOG_INFO("{}", metrics_.summary_line());
+
+    // R8：写会话头，便于离线回放时知道这是哪套配置
+    if (trace_writer_ && trace_writer_->ok()) {
+        nlohmann::json info;
+        info["tts_engine"] = tts_ ? tts_->engine_name() : "none";
+        info["llm_provider"] = llm_ ? llm_->provider_label() : "none";
+        info["remote_attached"] = remote_ != nullptr;
+        info["runtime_workers"] = config_.runtime_workers;
+        info["barge_in_budget_ms"] = 250;
+        trace_writer_->write_session_header(info);
+    }
 }
 
 void Orchestrator::stop() {
@@ -198,6 +276,10 @@ void Orchestrator::stop() {
         session_token_->cancel();
         session_token_.reset();
     }
+
+    // R1：先停后台任务池，再停音频 —— 反序会让 worker 在 audio_pipeline
+    // 已停后仍尝试写 TTS/EventBus。
+    tasks_.stop();
 
     if (audio_pipeline_) {
         audio_pipeline_->stop();
@@ -245,6 +327,7 @@ void Orchestrator::on_vad_speech_start(uint64_t timestamp_us) {
     // （原先依赖 smart_turn 智能判断误判率高且打断动作从未真正触发——真正的
     //   停止动作在 on_barge_in_detected/淡出回调，而 AudioRouter 从不触发淡出。）
     if (s == State::Speaking && smart_turn_.is_agent_speaking()) {
+        barge_in_start_ms_ = now_ms();   // R8：打断计时起点
         interrupt_agent_();
     }
 }
@@ -321,6 +404,8 @@ void Orchestrator::submit_segment_(std::vector<int16_t> seg) {
             const double t0 = now_ms();
             text = asr_->transcribe_segment(seg.data(), seg.size());
             if (trace_cb_) trace_cb_("asr", now_ms() - t0);
+            // R8：转写耗时（语音结束 → 文本）
+            metrics_.record(MetricKind::SpeechToAsr, now_ms() - t0);
             LOG_INFO("speech_end: ASR transcribed {} chars", text.size());
         }
         {
@@ -335,6 +420,10 @@ void Orchestrator::submit_segment_(std::vector<int16_t> seg) {
         if (user_text_cb_ && !text.empty()) user_text_cb_(text);
         if (text.empty()) {
             enter_idle_();
+        } else if (!admit_user_turn_(text)) {
+            // Policy / 意图判定为不需要起新轮次（附和、静默窗口等）
+            turn_busy_ = false;
+            enter_listening_();
         } else {
             enter_thinking_(text);
         }
@@ -351,7 +440,27 @@ void Orchestrator::interrupt_agent_() {
 
     LOG_WARN("Barge-in detected, interrupting agent");
 
-    // 取消当前 LLM 和 TTS（真正的停声动作：中断合成、清空待播音频）
+    // R8：打断响应延迟 —— 从用户开口到停声完成。
+    // 实施计划里的硬指标是 <250ms，这里是可观测的实测值。
+    turn_interrupted_.store(true);
+    trace_event_("USER_BARGE_IN");
+    metrics_.record(MetricKind::BargeInLatency, now_ms() - barge_in_start_ms_);
+    {
+        // 恢复中性，供下一轮使用
+        std::lock_guard<std::mutex> lock(policy_mutex_);
+        last_policy_action_.clear();
+    }
+    // ---- R1：按 policy 分派，而不是一刀切全 cancel ----
+    // 前台回答（正在播报的内容）立刻停；后台搜索/记忆/预取按各自 policy
+    // 决定 cancel / pause / continue / supersede。换话题时用户往往只是
+    // 改主意了，把已经跑了一半的搜索杀掉是浪费 —— 跑完的结果还能入 cache。
+    auto affected = tasks_.apply_interrupt();
+    if (!affected.empty()) {
+        LOG_INFO("Interrupt policy applied to {} task(s)", affected.size());
+    }
+
+    // 前台轮次仍由 session_token_ 统一收口：LLM 停止生成、TTS 停止合成、
+    // 清空待播音频。这三步是"停声"必需的，不走 TaskManager。
     if (session_token_) session_token_->cancel();
 
     if (llm_) llm_->stop();
@@ -360,8 +469,24 @@ void Orchestrator::interrupt_agent_() {
         audio_router_.stop_playback();
     }
 
+    // R6：丢弃还没播出去的段，避免打断后残留半句。
+    // 正在播的那段会被 stop() 掐断，清掉整份计划最干净 ——
+    // 本轮内容已经作废，不需要保留任何可修订的段。
+    response_plan_.clear();
+    speech_buffer_pending_.clear();
+    synth_cursor_.store(0);
+    speech_started_.store(false);
+    fast_response_.on_interrupt();   // R3：打断后允许下一轮重新抢答
+
     smart_turn_.agent_stop_speaking();
     eou_detector_.reset();
+
+    // 前台回答被取代：正在播的这条回答不再继续
+    {
+        Event e{EventType::ResponseSuperseded, 0, "", {}, "barge-in"};
+        e.turn_id = current_turn_id_.load();
+        global_event_bus().publish(std::move(e));
+    }
 
     enter_interrupting_();
 }
@@ -406,6 +531,148 @@ void Orchestrator::enter_thinking_(const std::string& text) {
     tts_accum_active_ = false;
     speech_started_.store(false);   // 新一轮 Thinking：等待首段音频以即时开播
 
+    // R6：新一轮 = 新的响应计划。情绪也复位（上一轮的情绪不该延续到下一轮）。
+    response_plan_.clear();
+    speech_buffer_pending_.clear();
+    synth_cursor_.store(0);
+    {
+        std::lock_guard<std::mutex> lock(emotion_mutex_);
+        current_emotion_.clear();
+        current_emotion_intensity_ = 0.0f;
+    }
+
+    // R8：起本轮 trace
+    turn_start_ns_ = now_ns();
+    turn_asr_done_ns_ = turn_start_ns_;   // 进入 thinking 即"文本就绪"
+    turn_llm_start_ns_ = now_ns();
+    turn_first_token_ns_ = 0;
+    turn_first_audio_ns_ = 0;
+    turn_interrupted_.store(false);
+    turn_user_text_ = text;
+    turn_ack_text_.clear();
+    turn_events_.clear();
+    trace_event_("TURN_START", text);
+
+    // 记下本轮用户输入：LLM 收尾时与回答一起进 ContextManager
+    {
+        std::lock_guard<std::mutex> lock(text_mutex_);
+        last_user_text_ = text;
+    }
+
+    // ---- R4：按本轮 tier 切换生成参数 ----
+    // Policy 在 admit_user_turn_ 里已算出 tier 并存进 last_route_，
+    // 这里把它落到 LLM 的采样参数上 —— 这就是"不把所有问题路由到最大模型"。
+    {
+        RouteResult route;
+        {
+            std::lock_guard<std::mutex> lock(policy_mutex_);
+            route = last_route_;
+        }
+        ModelTier tier = route.tier;
+        if (tier == ModelTier::Search && agent_tools_) {
+            // 有工具时用 Agent 档（工具调用需要稳定的 JSON 输出）
+            tier = ModelTier::Agent;
+        }
+        if (tier == ModelTier::Background) {
+            tier = ModelTier::Normal;   // 前台轮次不该跑在 Background 档
+        }
+
+        RouteResult applied = model_router_.route(tier);
+        // R7：判断这一档实际用的是不是远程引擎。降级后落到本地档时
+        // 必须为 false，否则会用远程请求去回答一个本该本地快答的问题。
+        route_tier_uses_remote_ = (applied.engine.rfind("remote:", 0) == 0);
+        if (llm_ && !route_tier_uses_remote_) {
+            llm_->apply_sampling(applied.profile.temperature,
+                                 applied.profile.top_k,
+                                 applied.profile.top_p,
+                                 applied.profile.max_tokens);
+        }
+        {
+            std::lock_guard<std::mutex> lock(policy_mutex_);
+            last_route_ = applied;
+        }
+        LOG_INFO("Route: tier=%s engine=%s remote=%s temp=%.2f top_k=%d max_tokens=%d",
+                 model_tier_to_string(applied.tier),
+                 applied.engine.c_str(),
+                 route_tier_uses_remote_ ? "yes" : "no",
+                 applied.profile.temperature, applied.profile.top_k,
+                 applied.profile.max_tokens);
+        {
+            Event e{EventType::RouteDecision, 0, "", {},
+                    model_tier_to_string(applied.tier)};
+            e.turn_id = current_turn_id_.load();
+            global_event_bus().publish(std::move(e));
+        }
+    }
+
+    // ---- R7：远程强模型（DEEP/AGENT/SEARCH 档且已挂远程引擎）----
+    // 刻意**不走**本地 AgentLoop 工具链：远程的 tool calling 协议与本地
+    // GBNF grammar 是两套系统，混用会产生难以排查的行为差异。远程档只做
+    // 对话 + 推理，工具结果通过 ContextManager 的 P6 层喂进去。
+    if (remote_ && route_tier_uses_remote_) {
+        const double t_remote = now_ms();
+        RemoteLLM::ChatRequest creq;
+
+        // system：把分层上下文作为系统消息
+        const std::string sys = build_system_prompt_with_context_(text);
+        if (!sys.empty()) {
+            RemoteMessage m;
+            m.role = "system";
+            m.content = sys;
+            creq.messages.push_back(std::move(m));
+        }
+        // 最近几轮对话作为历史（ContextManager 的 P3 层已经在 sys 里，
+        // 这里只带最近两轮原文，避免重复占用 context）
+        for (const auto& t : context_.turns()) {
+            if (!t.user.empty()) {
+                RemoteMessage m;
+                m.role = "user";
+                m.content = t.user;
+                creq.messages.push_back(std::move(m));
+            }
+            if (!t.assistant.empty()) {
+                RemoteMessage m;
+                m.role = "assistant";
+                m.content = t.assistant;
+                creq.messages.push_back(std::move(m));
+            }
+        }
+        RemoteMessage um;
+        um.role = "user";
+        um.content = text;
+        creq.messages.push_back(std::move(um));
+
+        auto rres = remote_->chat(
+            creq,
+            [this](const std::string& tok) {
+                if (state_.load() == State::Thinking) {
+                    on_llm_token_(LLMResponse{tok, false, 0});
+                }
+            },
+            session_token_);
+
+        if (trace_cb_) trace_cb_("llm_remote", now_ms() - t_remote);
+
+        if (rres.cancelled) {
+            LOG_INFO("Remote turn cancelled");
+            return;
+        }
+        if (!rres.ok) {
+            // 远程失败：降级回本地继续答，而不是让用户等在沉默里。
+            // 这是"优雅降级"链的最后一环（见架构方案第 30 节）。
+            LOG_WARN("Remote LLM failed ({}), falling back to local", rres.error);
+            if (trace_cb_) trace_cb_("llm_remote_failed", 0);
+        } else {
+            if (!rres.content.empty() || !current_text().empty()) {
+                on_llm_complete_();
+            } else {
+                enter_idle_();
+            }
+            return;
+        }
+        // 落到下面走本地
+    }
+
     // ---- /memory 命令：直接执行并播报，不走 LLM ----
     if (memory_ && is_memory_command(text)) {
         std::string reply = memory_->run_command(text);
@@ -428,20 +695,10 @@ void Orchestrator::enter_thinking_(const std::string& text) {
             if (tool_cb_) tool_cb_(line);
         });
 
-        // 记忆召回注入 system prompt
-        std::string sys_prompt = agent_system_prompt_;
-        if (memory_ && memory_->is_open()) {
-            auto recalled = memory_->recall(text, 3);
-            if (!recalled.empty()) {
-                std::string ctx = "\n\n[相关记忆]";
-                for (auto& m : recalled) {
-                    ctx += "\n- " + m.content;
-                }
-                ctx += "\n";
-                sys_prompt += ctx;
-            }
-        }
-        loop.set_system_prompt(sys_prompt);
+        // R1：system prompt 走 ContextManager 分层拼装
+        // （P1 话题 / P3 最近对话 / P4 工作上下文 / P5 召回记忆），
+        // 不再在这里手拼 "[相关记忆]"。
+        loop.set_system_prompt(build_system_prompt_with_context_(text));
         // 工具意图门控：仅当用户明确要求（搜索/记忆/时间）时才放行对应工具
         loop.set_enabled_tools(detect_tool_intent(text));
         loop.set_token_sink([this](const std::string& token) {
@@ -496,6 +753,270 @@ void Orchestrator::enter_interrupting_() {
 
 // ========== EOU 回调 ==========
 
+// ========== R1：Conversation Runtime ==========
+
+std::string Orchestrator::last_policy_reason() const {
+    std::lock_guard<std::mutex> lock(policy_mutex_);
+    return last_policy_reason_;
+}
+
+void Orchestrator::submit_user_text(std::string text) {
+    if (!running_.load()) return;
+    if (text.empty()) return;
+
+    {
+        std::lock_guard<std::mutex> lock(text_mutex_);
+        accumulated_text_.clear();
+    }
+    if (user_text_cb_) user_text_cb_(text);
+
+    if (!admit_user_turn_(text)) {
+        // Policy 判定保持安静：不占用前台，不打断当前播报
+        enter_listening_();
+        return;
+    }
+    enter_thinking_(text);
+}
+
+TaskId Orchestrator::submit_background_task(
+    std::string name, std::string topic_key,
+    std::function<TaskOutcome(TaskContext&)> work) {
+    TaskSpec spec;
+    spec.name = std::move(name);
+    spec.topic_key = std::move(topic_key);
+    spec.priority = TaskPriority::Background;
+    // 关键：被打断时继续跑完（结果入 cache），不 kill。
+    // 用户换主意不代表已经跑到一半的搜索该被扔掉。
+    spec.policy = config_.background_continue_on_interrupt
+                      ? TaskPolicy::ContinueOnInterrupt
+                      : TaskPolicy::CancelOnInterrupt;
+    spec.turn_id = current_turn_id_.load();
+    spec.work = std::move(work);
+
+    const TaskId id = tasks_.submit(std::move(spec));
+    LOG_DEBUG("Background task #{} submitted: {}", id, name);
+    return id;
+}
+
+void Orchestrator::absorb_background_result_(TaskId id, const TaskOutcome& outcome) {
+    if (!outcome.ok || outcome.value.empty()) return;
+
+    auto snap = tasks_.get(id);
+    if (!snap.has_value()) return;
+
+    // 喂自适应延迟估计：下次同类任务就知道该不该先说一句
+    fast_response_.record_latency(snap->name, static_cast<int>(outcome.elapsed_ms));
+
+    // 关键：should_speak=false（被 supersede / 打断后继续跑完）的结果
+    // 只能进 cache，绝不能主动播报抢话。
+    bg_results_.put(snap->topic_key.empty() ? ("task:" + std::to_string(id))
+                                            : snap->topic_key,
+                    outcome.value, outcome.elapsed_ms,
+                    /*superseded=*/!outcome.should_speak);
+
+    LOG_INFO("Background task #{} done: {} chars, {}ms, speakable={} -> cache",
+             id, outcome.value.size(), static_cast<int>(outcome.elapsed_ms),
+             outcome.should_speak);
+}
+
+TaskId Orchestrator::spawn_background_for_decision_(const ResponseDecision& decision,
+                                                     const std::string& user_text) {
+    // 只有 Policy 明确要求、且允许后台化时才派生。
+    // 简单问题（Fast tier）绝不派生后台任务 —— 那只是浪费。
+    if (!decision.allow_background) return kInvalidTaskId;
+
+    if (decision.needs_search && search_router_) {
+        // 搜索：结果要的是结构化 hits 的摘要，不是原始 JSON
+        auto router = search_router_;
+        const std::string topic = "search:" + user_text.substr(0, 24);
+        return submit_background_task("search", topic,
+            [router, user_text](TaskContext& ctx) -> TaskOutcome {
+                SearchQuery q;
+                q.q = user_text;
+                q.topk = 8;
+                q.lang = "zh-CN";
+                q.time_range = "month";   // 时效性查询默认只要最近一月
+
+                auto hits = router->query(q, SearchPolicy::LocalFirst, ctx.token());
+                TaskOutcome o;
+                if (hits.empty()) {
+                    o.ok = false;
+                    o.error = "no hits";
+                    return o;
+                }
+                o.ok = true;
+                // 拼成可读的紧凑摘要（比原始 hits 省 token）
+                std::string s;
+                for (size_t i = 0; i < hits.size() && i < 5; ++i) {
+                    s += "- " + hits[i].title;
+                    if (!hits[i].snippet.empty()) s += "：" + hits[i].snippet;
+                    s += "\n";
+                }
+                o.value = std::move(s);
+                // 后台搜索结果默认不主动播报：用户可能已经换话题了。
+                // 由上层在确认仍relevant时才播。
+                o.should_speak = false;
+                return o;
+            });
+    }
+
+    if (decision.needs_memory && memory_ && memory_->is_open()) {
+        // 记忆预取：把召回结果备好，下一轮直接用
+        auto mem = memory_;
+        const std::string topic = "memory:" + user_text.substr(0, 24);
+        return submit_background_task("memory", topic,
+            [mem, user_text](TaskContext& ctx) -> TaskOutcome {
+                auto recalled = mem->recall(user_text, 5);
+                TaskOutcome o;
+                if (recalled.empty()) {
+                    o.ok = false;
+                    o.error = "no memory";
+                    return o;
+                }
+                o.ok = true;
+                std::string s;
+                for (auto& m : recalled) s += "- " + m.content + "\n";
+                o.value = std::move(s);
+                o.should_speak = false;
+                return o;
+            });
+    }
+
+    return kInvalidTaskId;
+}
+
+void Orchestrator::speak_ack_(const std::string& text) {
+    if (text.empty()) return;
+    // 抢答是"先垫一句"，不进对话历史、不进 LLM 上下文 —— 只是让用户
+    // 知道系统接住了。真正的回答还在后面。
+    if (tts_ && tts_enabled_.load()) {
+        tts_->synthesize_stream(text,
+            [this](const int16_t* audio, size_t frames, bool is_last) {
+                on_tts_chunk_(audio, frames, is_last);
+            });
+    }
+    if (token_cb_) token_cb_(text);   // GUI 也显示这一句
+}
+
+void Orchestrator::inject_cached_results_(const std::string& user_text) {
+    // 用户提到"刚才/那个/之前"时，把相关后台结果捞出来给本轮用。
+    // 这补上了 R1 的缺口：结果存了但没人读。
+    if (user_text.empty()) return;
+
+    auto hit = bg_results_.find_by_keyword(user_text);
+    if (!hit.has_value()) return;
+
+    // 追加到 P6 层（与本轮真实工具结果并存，不覆盖）
+    context_.add_background_result("[早前后台结果 · " + hit->topic_key + "]\n" +
+                                   hit->content);
+    LOG_INFO("Injected cached background result: topic='{}' ({} chars)",
+             hit->topic_key, hit->content.size());
+}
+
+bool Orchestrator::admit_user_turn_(const std::string& text) {
+    // 决策全部交给 admission_（唯一决策源），这里只执行它的结论。
+    admission_.set_agent_speaking(smart_turn_.is_agent_speaking());
+    TurnAdmissionResult r = admission_.evaluate(text);
+
+    {
+        std::lock_guard<std::mutex> lock(policy_mutex_);
+        last_policy_reason_ = r.reason;
+        last_policy_action_ = response_action_to_string(r.decision.action);
+        // R4：把 Policy 选中的 tier 记下来，enter_thinking_ 会据此切采样参数
+        last_route_.requested = r.decision.tier;
+        last_route_.tier = r.decision.tier;
+        last_route_.profile = model_router_.profile_for(r.decision.tier);
+    }
+    LOG_INFO("Admission: intent={} action={} tier={} start_turn={} interrupt={} reason={}",
+             user_speech_intent_to_string(r.intent),
+             response_action_to_string(r.decision.action),
+             model_tier_to_string(r.decision.tier),
+             r.should_start_turn, r.should_interrupt, r.reason);
+
+    // 换话题：把上一话题的后台任务标记 superseded（不 kill），
+    // 跑完的结果仍进 cache，但不会主动播报抢话。
+    if (r.supersede_stale_tasks) {
+        for (const auto& snap : tasks_.active()) {
+            if (snap.topic_key.empty()) continue;
+            if (snap.priority == TaskPriority::Foreground) continue;
+            tasks_.supersede_topic(snap.topic_key, kInvalidTaskId);
+        }
+    }
+
+    // 先让出话轮（用户说了"等一下"/"算了"），再决定要不要起新轮次。
+    if (r.should_interrupt && smart_turn_.is_agent_speaking()) {
+        interrupt_agent_();
+    }
+
+    if (r.should_start_turn) {
+        current_turn_id_.store(admission_.current_turn_id());
+        // P6 层是"本轮"上下文：新轮次开始先清上一轮的结果条目，
+        // 否则会不断累积。内容本身在 BackgroundCache 里，不会丢。
+        context_.clear_results();
+        Event e{EventType::TurnComplete, 0, text, {}, ""};
+        e.turn_id = current_turn_id_.load();
+        global_event_bus().publish(std::move(e));
+
+        // ---- R3：Fast Response + Background Agent ----
+        fast_response_.begin_turn();
+
+        // 1) 慢任务先垫一句（"我看一下。"），不让用户干等
+        const char* task_type = r.decision.needs_search  ? "search"
+                                : r.decision.needs_memory ? "memory"
+                                : r.decision.needs_agent  ? "agent"
+                                                           : "llm";
+        FastResponsePlan plan = fast_response_.plan(r.decision, task_type, text);
+        if (plan.decision == AckDecision::Acknowledge) {
+            speak_ack_(plan.text);
+            fast_response_.notify_spoke();
+            turn_ack_text_ = plan.text;   // R8：记入 trace
+            {
+                Event e{EventType::QuickResponse, 0, plan.text, {}, plan.reason};
+                e.turn_id = current_turn_id_.load();
+                global_event_bus().publish(std::move(e));
+            }
+            LOG_INFO("Fast response ack: '{}' ({})", plan.text, plan.reason);
+        }
+
+        // 2) Policy 说要 search/memory/agent → 把耗时工作挪到后台，
+        //    前台不等它。
+        const TaskId bg = spawn_background_for_decision_(r.decision, text);
+        if (bg != kInvalidTaskId) {
+            LOG_INFO("Spawned background task #{} for this turn", bg);
+        }
+
+        // 3) 把早前后台结果注入本轮上下文（"刚才那个搜索结果"能被引用）
+        inject_cached_results_(text);
+    }
+    return r.should_start_turn;
+}
+
+std::string Orchestrator::build_system_prompt_with_context_(
+    const std::string& user_text) {
+    std::string sys_prompt = agent_system_prompt_;
+
+    // 召回记忆交给 ContextManager 统一管（P5 层），不再直接往 system prompt 拼。
+    if (memory_ && memory_->is_open()) {
+        auto recalled = memory_->recall(user_text, 3);
+        if (!recalled.empty()) {
+            std::vector<std::string> v;
+            v.reserve(recalled.size());
+            for (auto& m : recalled) v.push_back(m.content);
+            context_.set_relevant_memory(std::move(v));
+        }
+    }
+
+    // WorkingContext 与 ContextManager 共享同一份 WorkingContext 实例，
+    // 避免"准入时清了一份、拼 prompt 时读的是另一份"。
+    std::string ctx = context_.build_context();
+    if (!ctx.empty()) {
+        sys_prompt += "\n\n" + ctx + "\n";
+    }
+    return sys_prompt;
+}
+
+// ========== EOU 回调 ==========
+
 void Orchestrator::on_eou_(bool is_eou) {
     if (!running_.load()) return;
 
@@ -543,33 +1064,29 @@ void Orchestrator::on_llm_token_(const LLMResponse& chunk) {
             accumulated_text_ += chunk.text;
         }
 
+        // R8：首 token 到达（TTFT 观测点）
+        if (turn_first_token_ns_ == 0) {
+            turn_first_token_ns_ = now_ns();
+            if (turn_llm_start_ns_ > 0) {
+                const double ttft = static_cast<double>(turn_first_token_ns_ -
+                                                         turn_llm_start_ns_) / 1e6;
+                metrics_.record(MetricKind::LlmTtft, ttft);
+                trace_event_("LLM_FIRST_TOKEN");
+            }
+        }
+
         // 回调给上层（流式增量 → 实时回复面板）
         if (token_cb_) {
             token_cb_(chunk.text);
         }
 
         // 流式触发 TTS（边生成边合成）；开关关闭时跳过。
-        // 无论引擎为何，都按"句级切分"喂入：累积到句子边界才交给 TTS/系统语音整句朗读。
-        // 注意不可逐 token 直灌——SAPI 一次 Speak 会清空当前读本，逐字喂会互相打断只读几字。
+        // R6：文本先进 ResponsePlan，由 ProsodyPlanner 切句 + 加韵律，
+        // 再经 ITtsAdapter 落到具体引擎。
+        // 仍然坚持"句级"而非逐 token 直灌 —— SAPI 一次 Speak 会清空当前读本，
+        // 逐字喂会互相打断只读几字。
         if (tts_ && tts_enabled_.load() && state_.load() == State::Thinking) {
-            tts_->set_cancel_token(session_token_);
-            tts_accum_active_ = true;
-
-            stream_sentence_ += chunk.text;
-            size_t cut = 0;
-            while ((cut = find_sentence_boundary(stream_sentence_)) != std::string::npos) {
-                std::string sentence = stream_sentence_.substr(0, cut + 1);
-                stream_sentence_.erase(0, cut + 1);
-                // 纯空白/标点组成的空句跳过，避免无谓的单字符合成
-                if (sentence_has_content(sentence)) {
-                    const double t0 = now_ms();
-                    tts_->synthesize_stream(sentence,
-                        [this](const int16_t* audio, size_t frames, bool is_last) {
-                            on_tts_chunk_(audio, frames, is_last);
-                        });
-                    tts_accum_ms_.store(tts_accum_ms_.load() + (now_ms() - t0));
-                }
-            }
+            feed_speech_text_(chunk.text);
         }
 
         // LLM 结束
@@ -582,25 +1099,31 @@ void Orchestrator::on_llm_token_(const LLMResponse& chunk) {
 void Orchestrator::on_llm_complete_() {
     if (!running_.load()) return;
 
-    // 把未到句子边界的残留文本合成（LLM 结束但尾句无标点，也要播出来）
-    if (!stream_sentence_.empty() && tts_ && tts_enabled_.load()) {
-        std::string tail = std::move(stream_sentence_);
-        tts_accum_active_ = true;
-        const double t0 = now_ms();
-        tts_->synthesize_stream(tail,
-            [this](const int16_t* audio, size_t frames, bool is_last) {
-                on_tts_chunk_(audio, frames, is_last);
-            });
-        tts_accum_ms_.store(tts_accum_ms_.load() + (now_ms() - t0));
+    // R6：把未到句子边界的残留文本作为尾句补进来
+    // （LLM 结束但尾句无标点，也要播出来）
+    if (tts_ && tts_enabled_.load()) {
+        flush_speech_tail_();
     }
 
     std::string final_text;
+    std::string user_text;
     {
         std::lock_guard<std::mutex> lock(text_mutex_);
         final_text = std::move(accumulated_text_);
+        user_text = last_user_text_;
     }
 
     LOG_INFO("LLM generation complete: {} chars", final_text.size());
+
+    // R1：本轮落进 WorkingContext —— 用户输入 + 助手回答。
+    // 下一轮拼 prompt 时会作为 P3 层（最近对话）注入，"那个/刚才那个"
+    // 才有东西可指。
+    if (!final_text.empty()) {
+        context_.add_turn(user_text, final_text);
+    }
+
+    // R8：本轮 trace 收尾（写盘 + 指标）
+    finish_turn_trace_();
 
     // 完整回答整段回调一次（GUI 以此在对话区落一条完整气泡 + 记录最近回复）
     if (!final_text.empty() && text_callback_) {
@@ -636,6 +1159,14 @@ void Orchestrator::on_tts_chunk_(const int16_t* audio, size_t frames, bool is_la
     // 不必等 LLM 全部生成完（否则 TTS 音频会憋在 AudioRouter 里直到结束才出声）。
     if (state_.load() == State::Thinking && !speech_started_.exchange(true)) {
         enter_speaking_();
+        // R8：首段音频 —— 这是体感最关键的一条指标
+        turn_first_audio_ns_ = now_ns();
+        if (turn_asr_done_ns_ > 0) {
+            metrics_.record(MetricKind::AsrToFirstAudio,
+                            static_cast<double>(turn_first_audio_ns_ -
+                                                turn_asr_done_ns_) / 1e6);
+        }
+        trace_event_("TTS_FIRST_AUDIO");
     }
 
     if (audio_router_.is_playing()) {
@@ -644,7 +1175,185 @@ void Orchestrator::on_tts_chunk_(const int16_t* audio, size_t frames, bool is_la
 
     if (is_last) {
         LOG_DEBUG("TTS stream complete");
+        // R6：段合成完成，推进 ResponsePlan 的播放游标
+        const size_t idx = synth_cursor_.load();
+        response_plan_.mark_played(idx);
+        synth_cursor_.store(idx + 1);
+        // 还有下一段就继续送，形成连播
+        if (response_plan_.pending_count() > 0) {
+            pump_next_segment_();
+        }
     }
+}
+
+// ========== R6：韵律 / 响应修订 ==========
+
+void Orchestrator::set_emotion(std::string emotion, float intensity) {
+    std::lock_guard<std::mutex> lock(emotion_mutex_);
+    current_emotion_ = std::move(emotion);
+    // 强度不足直接清空 —— 半吊子的情绪比没有情绪更像机器人
+    current_emotion_intensity_ = intensity;
+}
+
+void Orchestrator::feed_speech_text_(const std::string& token) {
+    if (token.empty()) return;
+
+    // 累积缓冲放在 ResponsePlan 之外：ResponsePlan 管的是"已切好的段"，
+    // 这里管的是"还没到句子边界的半句"。
+    speech_buffer_pending_ += token;
+
+    // 切出所有完整句
+    auto sents = ProsodyPlanner::split_sentences(speech_buffer_pending_);
+    if (sents.empty()) return;
+
+    // split_sentences 会丢掉不含内容的段，剩余部分留着等下一批 token
+    // 用"已消费的字符数"反推还剩多少，比逐句 erase 更快也更不容易出错。
+    size_t consumed = 0;
+    for (const auto& s : sents) consumed += s.size();
+    speech_buffer_pending_.erase(0, consumed);
+
+    // 保留纯空白（split 会把它们丢掉）
+    const size_t first_nonspace = speech_buffer_pending_.find_first_not_of(" \t\r\n");
+    if (first_nonspace == std::string::npos) {
+        speech_buffer_pending_.clear();
+    } else if (first_nonspace > 0) {
+        speech_buffer_pending_.erase(0, first_nonspace);
+    }
+
+    std::string emotion;
+    float intensity = 0.0f;
+    {
+        std::lock_guard<std::mutex> lock(emotion_mutex_);
+        emotion = current_emotion_;
+        intensity = current_emotion_intensity_;
+    }
+
+    // 逐段 plan（不整体再切一次 —— sents 已经是切好的句子）
+    std::vector<SpeechSegment> segs;
+    segs.reserve(sents.size());
+    for (size_t i = 0; i < sents.size(); ++i) {
+        auto seg = prosody_planner_.plan_segment(sents[i], emotion, intensity);
+        if (i == 0 && synth_cursor_.load() == 0) {
+            seg.pause_before_ms = 60;   // 轮次开头稍停
+        }
+        segs.push_back(std::move(seg));
+    }
+
+    response_plan_.append(segs);
+    tts_accum_active_ = true;
+    pump_next_segment_();
+}
+
+void Orchestrator::flush_speech_tail_() {
+    if (speech_buffer_pending_.empty()) return;
+
+    std::string tail = std::move(speech_buffer_pending_);
+    speech_buffer_pending_.clear();
+    if (!sentence_has_content(tail)) return;
+
+    std::string emotion;
+    float intensity = 0.0f;
+    {
+        std::lock_guard<std::mutex> lock(emotion_mutex_);
+        emotion = current_emotion_;
+        intensity = current_emotion_intensity_;
+    }
+    auto seg = prosody_planner_.plan_segment(tail, emotion, intensity);
+    // 轮次末尾留白：否则下一轮的第一句紧贴上来，像说了两件事
+    seg.pause_after_ms = std::max(seg.pause_after_ms, 180);
+    response_plan_.append({std::move(seg)});
+    tts_accum_active_ = true;
+    pump_next_segment_();
+}
+
+bool Orchestrator::pump_next_segment_() {
+    if (!tts_ || !tts_adapter_) return false;
+
+    auto seg = response_plan_.next_to_synthesize();
+    if (!seg.has_value()) return false;
+
+    const size_t idx = synth_cursor_.load();
+    response_plan_.mark_synthesized(idx);
+    response_plan_.mark_playing(idx);
+
+    tts_->set_cancel_token(session_token_);
+    const double t0 = now_ms();
+    tts_adapter_->synthesize(
+        *seg, [this](const int16_t* audio, size_t frames, bool is_last) {
+            on_tts_chunk_(audio, frames, is_last);
+        });
+    tts_accum_ms_.store(tts_accum_ms_.load() + (now_ms() - t0));
+    LOG_DEBUG("Synthesized segment #{} ({} chars, {}ms est): {}",
+              idx, seg->text.size(), seg->estimated_ms, seg->text);
+    return true;
+}
+
+size_t Orchestrator::discard_unplayed() {
+    const size_t n = response_plan_.discard_all_unplayed();
+    if (n > 0) {
+        speech_buffer_pending_.clear();
+        LOG_INFO("Discarded {} unplayed segment(s) (response revision)", n);
+    }
+    return n;
+}
+
+// ========== R8：可观测 ==========
+
+void Orchestrator::trace_event_(const std::string& type, const std::string& detail) {
+    if (!trace_enabled()) return;
+    TraceEvent ev;
+    ev.t_us = turn_start_ns_ > 0
+                  ? static_cast<uint64_t>((now_ns() - turn_start_ns_) / 1000)
+                  : 0;
+    ev.type = type;
+    ev.detail = detail;
+    turn_events_.push_back(std::move(ev));
+}
+
+void Orchestrator::finish_turn_trace_() {
+    if (!trace_enabled()) return;
+
+    // 补几个没打到的时点
+    if (turn_asr_done_ns_ == 0) turn_asr_done_ns_ = turn_llm_start_ns_;
+
+    trace_event_("TURN_COMPLETE");
+
+    TurnRecord rec;
+    rec.turn_id = std::to_string(current_turn_id_.load());
+    rec.user_text = turn_user_text_;
+    rec.user_intent = user_speech_intent_to_string(last_user_intent());
+    {
+        std::lock_guard<std::mutex> lock(policy_mutex_);
+        rec.policy_action = last_policy_action_;
+        rec.policy_reason = last_policy_reason_;
+        rec.route_tier = model_tier_to_string(last_route_.tier);
+        rec.route_engine = last_route_.engine;
+    }
+    rec.spoke_ack = !turn_ack_text_.empty();
+    rec.ack_text = turn_ack_text_;
+    rec.interrupted = turn_interrupted_.load();
+    rec.discard_count = static_cast<int>(response_plan_.stats().discarded);
+
+    const int64_t now = now_ns();
+    if (turn_asr_done_ns_ > 0 && turn_start_ns_ > 0) {
+        rec.speech_to_asr_ms =
+            static_cast<double>(turn_asr_done_ns_ - turn_start_ns_) / 1e6;
+    }
+    if (turn_first_token_ns_ > 0 && turn_llm_start_ns_ > 0) {
+        rec.llm_ttft_ms =
+            static_cast<double>(turn_first_token_ns_ - turn_llm_start_ns_) / 1e6;
+    }
+    if (turn_first_audio_ns_ > 0 && turn_asr_done_ns_ > 0) {
+        rec.asr_to_first_audio_ms =
+            static_cast<double>(turn_first_audio_ns_ - turn_asr_done_ns_) / 1e6;
+    }
+    if (turn_start_ns_ > 0) {
+        rec.total_ms = static_cast<double>(now - turn_start_ns_) / 1e6;
+        metrics_.record(MetricKind::TurnTotal, rec.total_ms);
+    }
+    rec.events = turn_events_;
+
+    trace_writer_->write_turn(rec);
 }
 
 // ========== 辅助 ==========
@@ -664,6 +1373,10 @@ void Orchestrator::set_tts_enabled(bool enabled) {
         // 关闭播报：中止正在进行的合成与播放
         if (tts_) tts_->stop();
         audio_router_.stop_playback();
+        // R6：清掉响应计划 —— 关闭后再打开不应该把旧内容接着念
+        response_plan_.clear();
+        speech_buffer_pending_.clear();
+        synth_cursor_.store(0);
         LOG_INFO("TTS playback disabled");
     } else if (!was && enabled) {
         LOG_INFO("TTS playback enabled");

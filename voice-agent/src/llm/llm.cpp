@@ -65,6 +65,32 @@ struct LLM::Impl {
         if (model_) llama_model_free(model_);
     }
 
+    // 按当前 cfg 重建采样链。
+    // 原先这些参数在 load() 里硬编码（top_k=50/top_p=0.95），导致
+    // LLMConfig.temperature 之外的分档参数根本无从改。
+    // 抽出这个方法是 ModelRouter 能按 tier 切换采样参数的前提。
+    void build_sampler_() {
+        if (smpl_) {
+            llama_sampler_free(smpl_);
+            smpl_ = nullptr;
+        }
+        auto sparams = llama_sampler_chain_default_params();
+        smpl_ = llama_sampler_chain_init(sparams);
+        if (cfg.top_k > 0) {
+            llama_sampler_chain_add(smpl_, llama_sampler_init_top_k(cfg.top_k));
+        }
+        if (cfg.top_p > 0.0f) {
+            llama_sampler_chain_add(smpl_, llama_sampler_init_top_p(cfg.top_p, 1));
+        }
+        llama_sampler_chain_add(smpl_, llama_sampler_init_temp(cfg.temperature));
+        llama_sampler_chain_add(
+            smpl_, llama_sampler_init_dist(
+                       static_cast<uint32_t>(
+                           std::chrono::steady_clock::now()
+                               .time_since_epoch()
+                               .count())));
+    }
+
     bool load(const LLMConfig& config) {
         cfg = config;
 
@@ -90,17 +116,7 @@ struct LLM::Impl {
             return true;
         }
 
-        auto sparams = llama_sampler_chain_default_params();
-        smpl_ = llama_sampler_chain_init(sparams);
-        llama_sampler_chain_add(smpl_, llama_sampler_init_top_k(50));
-        llama_sampler_chain_add(smpl_, llama_sampler_init_top_p(0.95f, 1));
-        llama_sampler_chain_add(smpl_, llama_sampler_init_temp(cfg.temperature));
-        llama_sampler_chain_add(
-            smpl_, llama_sampler_init_dist(
-                       static_cast<uint32_t>(
-                           std::chrono::steady_clock::now()
-                               .time_since_epoch()
-                               .count())));
+        build_sampler_();
 
         const char* t = llama_model_chat_template(model_, nullptr);
         if (t) chat_tmpl_ = t;
@@ -355,6 +371,34 @@ void LLM::stop() {
 
 void LLM::set_cancel_token(std::shared_ptr<CancelToken> token) {
     cancel_token_ = std::move(token);
+}
+
+void LLM::apply_sampling(float temperature, int top_k, float top_p, int max_tokens) {
+    if (generating_.load()) {
+        // 生成中换采样链会让当前这一轮的采样行为与已产出的 token 不一致
+        LOG_WARN("apply_sampling ignored: generation in progress");
+        return;
+    }
+
+    const bool changed = config_.temperature != temperature ||
+                         config_.top_k != top_k ||
+                         config_.top_p != top_p ||
+                         config_.max_tokens != max_tokens;
+    if (!changed) return;
+
+    config_.temperature = temperature;
+    config_.top_k = top_k;
+    config_.top_p = top_p;
+    config_.max_tokens = max_tokens;
+
+#ifdef USE_LLAMACPP
+    if (impl_ && impl_->real_) {
+        impl_->cfg = config_;
+        impl_->build_sampler_();
+    }
+#endif
+    LOG_DEBUG("apply_sampling: temp={} top_k={} top_p={} max_tokens={}",
+              temperature, top_k, top_p, max_tokens);
 }
 
 // ========== 工厂函数 ==========

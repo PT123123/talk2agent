@@ -40,6 +40,8 @@ inline std::shared_ptr<spdlog::logger> init_logger(
     // 创建 logger
     auto logger_ptr = std::make_shared<spdlog::logger>(name, begin(sinks), end(sinks));
     logger_ptr->set_level(spdlog::level::from_str(level));
+    // 每条 info 即 flush：进程闪退时日志不能滞留缓冲区（否则最后一行定位不了崩溃点）
+    logger_ptr->flush_on(spdlog::level::info);
     spdlog::register_logger(logger_ptr);
 
     return logger_ptr;

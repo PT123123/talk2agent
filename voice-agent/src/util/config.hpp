@@ -3,6 +3,7 @@
 #include "../core/types.hpp"
 #include "log.hpp"
 #include <nlohmann/json.hpp>
+#include <cstdlib>
 #include <fstream>
 #include <sstream>
 #include <string>
@@ -196,6 +197,22 @@ inline AppConfig load_config(const std::string& path) {
         cfg.searxng_url = s.value("searxng_url", "http://localhost:8080");
         cfg.tavily_key = s.value("tavily_key", "");
         cfg.brave_key = s.value("brave_key", "");
+    }
+
+    // R7：在线强模型（OpenAI 兼容）。
+    // 注意：api_key **不从 yaml 读** —— 配置文件可能进 git。
+    // 密钥从环境变量 VOICE_AGENT_REMOTE_API_KEY 取。
+    if (j.contains("remote_llm")) {
+        auto& r = j["remote_llm"];
+        cfg.remote_base_url = r.value("base_url", "");
+        cfg.remote_model = r.value("model", "");
+        cfg.remote_timeout_ms = r.value("timeout_ms", 30000);
+        cfg.remote_for_deep = r.value("for_deep", true);
+        cfg.remote_for_agent = r.value("for_agent", true);
+        cfg.remote_for_search = r.value("for_search", true);
+    }
+    if (const char* key = std::getenv("VOICE_AGENT_REMOTE_API_KEY")) {
+        cfg.remote_api_key_env = key;
     }
 
     // 日志

@@ -19,6 +19,12 @@ struct LLMConfig {
     int max_tokens = 512;            // 最大生成长度
     float repeat_penalty = 1.1f;     // 重复惩罚
     std::string prompt_template;      // 提示词模板
+
+    // 采样截断（R4 ModelRouter 分档用）。
+    // 原先这两项在 sampler chain 构建时硬编码成 50 / 0.95，
+    // 配置里写什么都不生效 —— 现在统一由 LLMConfig 驱动。
+    int top_k = 50;                  // <=0 表示不截断
+    float top_p = 0.95f;             // <=0 表示不截断
 };
 
 // LLM 响应
@@ -50,6 +56,16 @@ public:
 
     // 设置取消令牌
     void set_cancel_token(std::shared_ptr<CancelToken> token);
+
+    // R4：运行时切换采样参数（重建 sampler chain，无需重载模型）。
+    // 供 ModelRouter 按 tier 调整生成风格（FAST 要稳、DEEP 要准）。
+    void apply_sampling(float temperature, int top_k, float top_p, int max_tokens);
+
+    // 当前生效的采样参数
+    float temperature() const { return config_.temperature; }
+    int max_tokens() const { return config_.max_tokens; }
+    int top_k() const { return config_.top_k; }
+    float top_p() const { return config_.top_p; }
 
     // 是否正在生成
     bool is_generating() const { return generating_; }

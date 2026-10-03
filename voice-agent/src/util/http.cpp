@@ -142,8 +142,8 @@ Url parse_url(const std::string& url) {
         return u;
     }
     u.scheme = lowercase(url.substr(0, scheme_end));
-    if (u.scheme != "http") {
-        u.error = "unsupported scheme '" + u.scheme + "' (only http://)";
+    if (u.scheme != "http" && u.scheme != "https") {
+        u.error = "unsupported scheme '" + u.scheme + "' (http/https only)";
         return u;
     }
 
@@ -151,7 +151,9 @@ Url parse_url(const std::string& url) {
     auto host_end = url.find_first_of("/?#", p);
     std::string authority = (host_end == std::string::npos) ? url.substr(p) : url.substr(p, host_end - p);
 
-    u.port = 80;
+    // 端口缺省时留 0，由 effective_port() 按 scheme 取默认值。
+    // 这里保留显式判断是为了让 u.port 的语义对调用方透明。
+    u.port = 0;
     auto colon = authority.find(':');
     if (colon != std::string::npos) {
         u.host = authority.substr(0, colon);
@@ -189,6 +191,16 @@ Url parse_url(const std::string& url) {
     return u;
 }
 
+std::string Url::host_port() const {
+    return host + ":" + std::to_string(effective_port());
+}
+
+std::string Url::target() const {
+    std::string t = path.empty() ? "/" : path;
+    if (!query.empty()) t += "?" + query;
+    return t;
+}
+
 std::string url_encode(const std::string& s) {
     static const char* hex = "0123456789ABCDEF";
     std::string out;
@@ -207,7 +219,9 @@ std::string url_encode(const std::string& s) {
 
 // ========== HTTP GET ==========
 
-Response get(const Request& req) {
+// 原始 socket 实现：仅支持 http:// 非流式。
+// 对外入口是文件末尾的 get()/post()/stream()，那里会按 scheme 调度。
+Response do_get_socket(const Request& req) {
     Response resp;
     Url u = parse_url(req.url);
     if (!u.ok()) {
@@ -408,6 +422,61 @@ Response get(const Request& req) {
     }
     resp.body = std::move(body);
     return resp;
+}
+
+#ifdef _WIN32
+namespace winhttp_detail {
+Response do_request(const Request& req);
+StreamResponse do_stream(const StreamRequest& req);
+}  // namespace winhttp_detail
+#endif
+
+// ========== 对外统一入口 ==========
+// 调度规则：
+//   https            -> WinHTTP（系统 TLS）
+//   http + GET       -> 自实现 socket（无外部依赖，供本地 SearXNG 用）
+//   http + POST      -> 同上（简化实现，见 post()）
+//   stream()         -> WinHTTP（需要逐块读取）
+Response get(const Request& req) {
+    Url u = parse_url(req.url);
+    if (!u.ok()) {
+        Response r;
+        r.error = "invalid URL: " + (u.error.empty() ? "unparseable" : u.error);
+        return r;
+    }
+#ifdef _WIN32
+    if (u.is_tls()) return winhttp_detail::do_request(req);
+#endif
+    return do_get_socket(req);
+}
+
+Response post(const Request& req) {
+    Url u = parse_url(req.url);
+    if (!u.ok()) {
+        Response r;
+        r.error = "invalid URL: " + (u.error.empty() ? "unparseable" : u.error);
+        return r;
+    }
+#ifdef _WIN32
+    // WinHTTP 同时支持 GET/POST，统一走它（http 走 WinHTTP 也无妨，
+    // 少维护一条路径）。
+    return winhttp_detail::do_request(req);
+#else
+    // 非 Windows：POST 未实现。在线 LLM 本来就是 Windows 优先场景。
+    Response r;
+    r.error = "POST not supported on this platform (WinHTTP is Windows-only)";
+    return r;
+#endif
+}
+
+StreamResponse stream(const StreamRequest& req) {
+    StreamResponse r;
+#ifdef _WIN32
+    return winhttp_detail::do_stream(req);
+#else
+    r.error = "stream not supported on this platform (WinHTTP is Windows-only)";
+    return r;
+#endif
 }
 
 }  // namespace voice_agent::http

@@ -20,6 +20,9 @@ struct AudioFrame {
 using PcmSink = std::function<void(const AudioFrame&)>;
 
 // ========== 事件类型 ==========
+// 注意：EventType::Error 必须保持为最后一个枚举值 —— EventBus 用
+// `subscriptions_[static_cast<size_t>(EventType::Error) + 1]` 定容，
+// 在 Error 之后追加新事件会导致数组越界。新事件一律插在 Error 之前。
 enum class EventType {
     // VAD 事件
     VadStart,
@@ -44,7 +47,35 @@ enum class EventType {
     StateChanged,
     // 音频设备
     DeviceChanged,
-    // 错误
+
+    // ========== R0：Conversation Runtime 事件 ==========
+    // 任务生命周期（TaskManager 发射）
+    TaskStarted,
+    TaskProgress,
+    TaskCompleted,
+    TaskFailed,
+    TaskCancelled,
+    TaskSuperseded,
+    // 工具执行（ToolWorker 发射，取代阻塞式工具调用）
+    ToolStarted,
+    ToolProgress,
+    ToolCompleted,
+    ToolFailed,
+    ToolCancelled,
+    // 模型生成细分（比 LlmToken 更细的时序观测点）
+    ModelStarted,
+    ModelFirstToken,
+    // 播放
+    PlaybackStarted,
+    PlaybackEnded,
+    // 对话语义
+    UserIntent,        // 载荷为 UserSpeechIntent 名字
+    TopicChanged,      // 载荷为新话题摘要
+    ResponseSuperseded,// 前台回答被新轮次取代
+    QuickResponse,     // 载荷为抢答/ack 文本（空 = 选择沉默）
+    TimingDecision,    // 载荷为 TimingDecision 名字
+    RouteDecision,     // 载荷为 ModelTier 名字
+    // 错误（必须保持最后）
     Error
 };
 
@@ -54,6 +85,11 @@ struct Event {
     std::string text;          // ASR 文本
     std::vector<Sample> audio; // TTS 音频
     std::string payload;       // 通用载荷（JSON 等）
+
+    // R0：跨模块关联。turn_id 关联同一轮对话，task_id 关联后台任务。
+    // 缺省 0 表示"不属于任何轮次/任务"（如全局设备事件）。
+    uint64_t turn_id{0};
+    uint64_t task_id{0};
 };
 
 // ========== LLM 类型 ==========
@@ -191,6 +227,19 @@ struct AppConfig {
     std::string searxng_url{"http://localhost:8080"};
     std::string tavily_key;
     std::string brave_key;
+
+    // ========== R7：在线强模型（OpenAI 兼容）==========
+    // base_url 为空则不挂远程引擎，DEEP 档自动降级到本地 NORMAL/FAST。
+    // 密钥不写入 yaml（配置文件可能进 git），只在运行时传入。
+    std::string remote_base_url;
+    std::string remote_model;
+    int  remote_timeout_ms{30000};
+    // 密钥从环境变量读，不落 yaml（配置文件可能进 git）
+    std::string remote_api_key_env;
+    // 远程引擎注册到哪些档位。默认只给 DEEP —— 简单问题坚决不碰网络。
+    bool remote_for_deep{true};
+    bool remote_for_agent{true};
+    bool remote_for_search{true};
 
     // 记忆（M6）
     std::string memory_db_path{"memory.db"};

@@ -219,7 +219,12 @@ endif()
 # ========== 源文件组织 ==========
 set(CORE_SOURCES
     src/core/event_bus.cpp
+    src/core/task.cpp
+    src/core/working_context.cpp
     src/util/http.cpp
+    src/util/http_winhttp.cpp
+    src/util/voice_trace.cpp
+    src/util/latency_metrics.cpp
     src/util/gpu.cpp
     src/audio/audio_device.cpp
     src/audio/audio_pipeline.cpp
@@ -233,6 +238,9 @@ set(CORE_SOURCES
     src/tts/sapi_speaker.cpp
     src/tts/speaker.cpp
     src/tts/streaming_speaker.cpp
+    src/tts/prosody.cpp
+    src/tts/response_plan.cpp
+    src/tts/tts_adapter.cpp
     src/llm/llm.cpp
     src/agent/grammar.cpp
     src/agent/tool_registry.cpp
@@ -242,6 +250,14 @@ set(CORE_SOURCES
     src/orchestrator/eou_detector.cpp
     src/orchestrator/smart_turn.cpp
     src/orchestrator/audio_router.cpp
+    src/orchestrator/user_intent.cpp
+    src/orchestrator/response_policy.cpp
+    src/orchestrator/turn_admission.cpp
+    src/orchestrator/fast_response.cpp
+    src/orchestrator/background_cache.cpp
+    src/orchestrator/model_router.cpp
+    src/orchestrator/model_engines.cpp
+    src/orchestrator/remote_llm.cpp
     src/search/isearch.cpp
     src/search/searxng_provider.cpp
     src/search/online_providers.cpp
@@ -376,4 +392,22 @@ endif()
 install(TARGETS voice_agent_core ARCHIVE DESTINATION lib)
 if(TARGET voice-agent)
     install(TARGETS voice-agent RUNTIME DESTINATION bin)
+endif()
+
+# ========== 诊断：AddressSanitizer（默认关闭；-DENABLE_ASAN=ON 开启）==========
+# 只插桩本项目的源码（core + exe），不插桩 Qt/llama/ORT 等预编译库；
+# ASan 运行时接管进程堆，第三方库的堆越界也会在下一次分配/释放时被捕获。
+if(ENABLE_ASAN)
+    target_compile_options(voice_agent_core PRIVATE /fsanitize=address)
+    if(TARGET voice-agent)
+        target_compile_options(voice-agent PRIVATE /fsanitize=address /Zi)
+        target_link_options(voice-agent PRIVATE /INFERASANLIBS /INCREMENTAL:NO /DEBUG)
+    endif()
+    # 源码编译的第三方 C++ 静态库必须同插桩，否则 STL 注解不一致（LNK2038）
+    foreach(_asan_tgt spdlog llama ggml ggml-base ggml-cpu ggml-vulkan vendor-hash)
+        if(TARGET ${_asan_tgt})
+            target_compile_options(${_asan_tgt} PRIVATE /fsanitize=address)
+        endif()
+    endforeach()
+    message(STATUS "AddressSanitizer enabled (diagnostics)")
 endif()

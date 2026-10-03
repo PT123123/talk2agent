@@ -123,6 +123,8 @@ private:
     // 非 C++ 异常，try/catch 抓不到），放任会经 std::terminate 连 GUI 一起退出。
     // 用 MSVC SEH 拦截：单模块崩溃回退安全态，保证"启动不退出、界面正常"。
     // step/total 引用用于驱动 initCore_ 的进度条（SEH 拦截后 step 已停在失败阶段）。
+    // 注意：struct Impl 的前置声明必须位于下方四个方法之前（名字需先声明才能用于签名）。
+    struct Impl;
     int initModelsGuarded_(Impl* impl, int& step, int total);
     void initModelsWork_(Impl* impl);     // 无 __try 的真实启动装载实现
     int applyModelsGuarded_(Impl* impl, const ModelPaths& paths);

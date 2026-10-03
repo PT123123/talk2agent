@@ -22,6 +22,10 @@
 #include <QVariantList>
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
+// SEH（__try/__except、EXCEPTION_EXECUTE_HANDLER、GetExceptionCode）所需声明。
+// 只引 excpt.h，不引 windows.h，避免 min/max 宏污染 Qt/std 代码。
+#include <excpt.h>
 #include <filesystem>
 #include <fstream>
 #include <map>
@@ -370,7 +374,8 @@ void AgentController::initCore_() {
     int step = 0;
 
     // 配置（缺失时回退默认值）
-    emit loadStageChanged(++step, total, kInitStages[step - 1]);
+    ++step;
+    emit loadStageChanged(step, total, kInitStages[step - 1]);
     try {
         impl->cfg = load_config("configs/agent.yaml");
     } catch (...) {
@@ -378,7 +383,8 @@ void AgentController::initCore_() {
     }
 
     // 搜索路由：本地 SearXNG 优先，在线 Provider 桩
-    emit loadStageChanged(++step, total, kInitStages[step - 1]);
+    ++step;
+    emit loadStageChanged(step, total, kInitStages[step - 1]);
     impl->router = std::make_shared<SearchRouter>();
     if (!impl->cfg.searxng_url.empty()) {
         impl->router->add_provider(
@@ -389,7 +395,8 @@ void AgentController::initCore_() {
     }
 
     // 持久化记忆
-    emit loadStageChanged(++step, total, kInitStages[step - 1]);
+    ++step;
+    emit loadStageChanged(step, total, kInitStages[step - 1]);
     std::filesystem::create_directories("data");
     impl->memory = std::make_shared<MemoryManager>("data/voice_agent.db");
     if (!impl->memory->open()) {
@@ -399,7 +406,8 @@ void AgentController::initCore_() {
     }
 
     // 工具注册（get_time / web_search / memory_save / memory_query）
-    emit loadStageChanged(++step, total, kInitStages[step - 1]);
+    ++step;
+    emit loadStageChanged(step, total, kInitStages[step - 1]);
     impl->registry = std::make_shared<ToolRegistry>();
     ToolKit kit{impl->router, impl->memory->store()};
     register_builtin_tools(*impl->registry, kit);
@@ -419,12 +427,30 @@ void AgentController::initCore_() {
     impl->asr = std::make_shared<ASR>();
     impl->tts = std::make_shared<TTS>();
     // initModelsWork_ 内部独立 try/catch，单模失败不影响其余四个
-    initModelsGuarded_(impl.get(), step, total);
+    // 诊断开关：VOICE_AGENT_NO_MODELS=1 时跳过真实模型加载（排查堆损坏用）
+    const bool no_models = std::getenv("VOICE_AGENT_NO_MODELS") != nullptr;
+    int seh_rc = 0;
+    if (no_models) {
+        emit logLine("VOICE_AGENT_NO_MODELS=1：跳过真实模型加载，保持 Mock（诊断模式）。");
+    } else {
+        seh_rc = initModelsGuarded_(impl.get(), step, total);
+    }
+    if (seh_rc != 0) {
+        emit errorLine(QStringLiteral("模型加载触发访问违规（0x%1），已回退 Mock 模式，界面保持运行。")
+                           .arg(static_cast<uint>(seh_rc), 0, 16));
+    }
 
     // Orchestrator 全双工状态机：真实麦克风采集 → VAD → ASR → LLM/工具 → TTS → 播放
-    emit loadStageChanged(++step, total, kInitStages[step - 1]);
-    impl->audio = createAudioPipeline_();
-    impl->orch = buildOrchestrator_(impl->audio);
+    ++step;
+    emit loadStageChanged(step, total, kInitStages[step - 1]);
+    // 诊断开关：VOICE_AGENT_NO_AUDIO=1 时跳过音频/状态机装配（定位启动崩溃用）
+    const bool no_audio = std::getenv("VOICE_AGENT_NO_AUDIO") != nullptr;
+    if (no_audio) {
+        emit logLine("VOICE_AGENT_NO_AUDIO=1：跳过音频管道与 Orchestrator 装配（诊断模式）。");
+    } else {
+        impl->audio = createAudioPipeline_();
+        impl->orch = buildOrchestrator_(impl->audio);
+    }
 
     // 订阅状态事件 → 界面（并驱动语音轮次的开始/结束计时）
     impl->event_token = global_event_bus().subscribe(
@@ -465,15 +491,14 @@ void AgentController::initCore_() {
 // ========== SEH 就地防护（拦截 0xc0000005 等硬件异常）==========
 // MSVC SEH：__try / __except；E06D 对应 C++ throw
 // C2712 约束：含 __try 的函数不得有带析构的局部对象（智能指针/容器等）。
-// 策略：Impl 以原始指针传入；__try 内只调用成员方法，不触发隐式析构链。
+// 策略：Impl 以原始指针传入；__try/__except 两块内不创建任何 C++ 对象
+//（QString 临时也算），仅返回异常码，由调用方负责 emit 日志。
 
 int AgentController::initModelsGuarded_(Impl* impl, int& step, int total) {
     __try {
         initModelsWork_(impl);
         return 0;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
-        emit errorLine(QStringLiteral("模型加载触发访问违规（0x%1），已回退 Mock 模式，界面保持运行。")
-                           .arg(GetExceptionCode(), 0, 16));
         return static_cast<int>(GetExceptionCode());
     }
 }
@@ -541,8 +566,6 @@ int AgentController::applyModelsGuarded_(Impl* impl, const ModelPaths& paths) {
         applyModelsWork_(impl, paths);
         return 0;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
-        emit errorLine(QStringLiteral("模型切换触发访问违规（0x%1），保持原有模型。")
-                           .arg(GetExceptionCode(), 0, 16));
         return static_cast<int>(GetExceptionCode());
     }
 }
@@ -833,8 +856,11 @@ void AgentController::emitModelStatus_() {
             return {!impl_->cfg.vad_model.empty() && impl_->vad != nullptr,
                     std::string("Silero")};
         if (key == "ASR")
+            // 注意：pair 第二个元素不参与 && 短路，必须显式判空
+            //（seedModelInfo_ 在模型对象创建前调用，asr 此时可能为 null）
             return {impl_->asr && impl_->asr->uses_real_backend(),
-                    impl_->asr->backend_name()};
+                    impl_->asr ? impl_->asr->backend_name()
+                               : std::string("Mock")};
         if (impl_->tts) {
             const std::string eng = impl_->tts->engine_name();
             return {impl_->tts->uses_real_backend(),
@@ -1000,7 +1026,11 @@ void AgentController::handleSetModels_(const ModelPaths& paths) {
     }
     // applyModelsWork_ 在 impl_ 上重建模型（in-place）；旧模型指针在 move 前始终有效。
     // SEH 拦截切换期间的访问违规，保证 GUI 进程不崩溃，旧模型继续服务。
-    applyModelsGuarded_(impl_.get(), paths);
+    const int seh_rc = applyModelsGuarded_(impl_.get(), paths);
+    if (seh_rc != 0) {
+        emit errorLine(QStringLiteral("模型切换触发访问违规（0x%1），保持原有模型。")
+                           .arg(static_cast<uint>(seh_rc), 0, 16));
+    }
     emit loadFinished(true);   // 旧模型仍可用，界面恢复可操作
 }
 
@@ -1034,6 +1064,20 @@ std::shared_ptr<Orchestrator> AgentController::buildOrchestrator_(
     orch->initialize(std::move(audio), impl_->vad, impl_->asr, impl_->llm, impl_->tts);
     orch->attach_agent(impl_->registry, impl_->router, kSystemPrompt);
     orch->attach_memory(impl_->memory);
+    // R7：挂载在线强模型（OpenAI 兼容）。base_url 为空则跳过，
+    // 此时 DEEP 档自动走本地模型 + 采样参数区分。
+    if (!impl_->cfg.remote_base_url.empty() && !impl_->cfg.remote_model.empty()) {
+        RemoteLLMConfig rcfg;
+        rcfg.base_url = impl_->cfg.remote_base_url;
+        rcfg.model = impl_->cfg.remote_model;
+        rcfg.timeout_ms = impl_->cfg.remote_timeout_ms;
+        rcfg.api_key = impl_->cfg.remote_api_key_env;
+        std::vector<ModelTier> tiers;
+        if (impl_->cfg.remote_for_deep) tiers.push_back(ModelTier::Deep);
+        if (impl_->cfg.remote_for_agent) tiers.push_back(ModelTier::Agent);
+        if (impl_->cfg.remote_for_search) tiers.push_back(ModelTier::Search);
+        orch->attach_remote_llm(rcfg, tiers);
+    }
     orch->set_tts_enabled(impl_->tts_enabled);
     orch->set_vad_enabled(vad_enabled_.load());
     orch->set_text_callback([this](const std::string& text) {

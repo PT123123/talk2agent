@@ -22,6 +22,21 @@ Thumbs.db
 # Config secrets
 configs/*.local.yaml
 
+# 运行时产物：崩溃转储 / 诊断文件会带本机绝对路径与用户名（C:\Users\<name>\...），
+# 属于信息泄露，绝不入库
+*crash_stack*.txt
+*_diag_*.txt
+*_stdout.txt
+*_stderr.txt
+
+# AI 工具的本地工作区（记忆/会话等），与项目代码无关
+.workbuddy/
+.trae-html-share-packages/
+
+# 记忆数据库（运行时生成）
+data/
+**/data/*.db
+
 # Large downloaded binaries / driver packages (not part of source)
 *.exe
 *.obj
