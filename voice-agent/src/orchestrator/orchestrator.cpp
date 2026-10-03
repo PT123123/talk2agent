@@ -62,6 +62,13 @@ Orchestrator::Orchestrator(Config config)
           /*default_estimate_ms*/600,
           /*max_acks_per_task*/1,
           /*ewma_alpha*/0.3})
+    , truncator_(InterruptionTruncation::Config{
+          /*min_played_ratio*/0.02,
+          /*interrupt_marker*/"（被用户打断）",
+          /*append_marker*/true})
+    , semantic_turn_(SemanticTurnDetector::Config{
+          /*eagerness*/config.eagerness,
+          /*short_utterance_chars*/6})
 {
     // 后台任务结果一律入 cache / WorkingContext，绝不主动抢话播报。
     // 播报与否由上层按 turn 上下文决定 —— 这里只负责"结果有地方放"。
@@ -450,6 +457,13 @@ void Orchestrator::interrupt_agent_() {
         std::lock_guard<std::mutex> lock(policy_mutex_);
         last_policy_action_.clear();
     }
+
+    // ---- R9a：必须在 stop_playback() 之前取播放进度 ----
+    // stop_playback() 会清空缓冲，之后就取不到"用户听到了多少"了。
+    if (config_.enable_interrupt_truncation) {
+        sync_interrupted_context_();
+    }
+
     // ---- R1：按 policy 分派，而不是一刀切全 cancel ----
     // 前台回答（正在播报的内容）立刻停；后台搜索/记忆/预取按各自 policy
     // 决定 cancel / pause / continue / supersede。换话题时用户往往只是
@@ -1030,6 +1044,36 @@ void Orchestrator::on_eou_(bool is_eou) {
             accumulated_text_.clear();
         }
 
+        // ---- R9b：语义复核（对标 semantic_vad）----
+        // EOUDetector 只有时长阈值，而时长是代理指标不是目标：
+        //   "我想问一下...(停 600ms)...那个项目"  纯时长会抢话
+        //   "好的"                                    纯时长会慢半拍
+        //
+        // 语义判断的职责是"延长等待"而非"缩短"。设计成**只调节 EOU 阈值**：
+        // 语义明显没说完时把 force_ms 临时拉长（不改变状态机流程），
+        // 用户继续说话则 VAD 会重新触发 on_vad_speech 走正常流程。
+        // 这样避免了"已取走文本再放回"这类脆弱的状态回滚。
+        if (!text.empty() && config_.enable_semantic_turn) {
+            const int waited = eou_detector_.waiting_ms();
+            const bool yield = semantic_turn_.should_yield(text, waited);
+            auto d = semantic_turn_.last_decision();
+
+            metrics_.record(MetricKind::EouDelay, waited);
+            trace_event_("SEMANTIC_TURN", d.reason);
+
+            if (!yield && d.hint == CompletionHint::Incomplete) {
+                // 明显没说完 —— 把 force 阈值拉长到语义上限，给用户更多时间。
+                const int ext = eagerness_config(semantic_turn_.eagerness()).max_wait_ms;
+                if (ext > config_.eou_force_ms) {
+                    EOUDetector::Config relaxed = eou_detector_.config();
+                    relaxed.force_ms = ext;
+                    eou_detector_.set_config(relaxed);
+                    LOG_DEBUG("EOU extended to %dms (semantic: incomplete) — %s",
+                              ext, d.reason.c_str());
+                }
+            }
+        }
+
         if (!text.empty()) {
             enter_thinking_(text);
         } else {
@@ -1295,6 +1339,50 @@ size_t Orchestrator::discard_unplayed() {
         LOG_INFO("Discarded {} unplayed segment(s) (response revision)", n);
     }
     return n;
+}
+
+// ========== R9a：打断上下文同步 ==========
+
+void Orchestrator::sync_interrupted_context_() {
+    // 关键前提：必须在 stop_playback() 之前调用。
+    // stop_playback() 会清空 tts_buffer_，之后 played_ratio 恒为 0。
+    const double ratio = audio_router_.played_ratio();
+    const int64_t pushed = audio_router_.total_frames_pushed();
+
+    // 本轮模型生成了多少（可能远多于播出的）
+    std::string generated;
+    {
+        std::lock_guard<std::mutex> lock(text_mutex_);
+        generated = accumulated_text_;
+    }
+    if (generated.empty() && pushed == 0) {
+        return;   // 还没来得及说任何话 —— 不算截断
+    }
+
+    TruncationResult r = truncator_.truncate(generated, ratio);
+    if (!r.truncated) return;
+
+    LOG_INFO("Interrupt truncation: played %.0f%% (%d chars kept, %d dropped)",
+             ratio * 100.0, static_cast<int>(r.played_text.size()),
+             static_cast<int>(r.dropped_text.size()));
+
+    // 1) 把"用户实际听到的"记入对话历史。
+    //    这样下一轮模型知道用户确实听过这部分内容。
+    if (!r.played_text.empty()) {
+        context_.add_turn(turn_user_text_, r.played_text);
+    }
+
+    // 2) 构造"被打断"说明写进 P2 层，下一轮 prompt 能看到。
+    //    对应 Azure 的 appended_text_after_truncation —— 模型若不知道
+    //    自己被打断，下一轮会困惑于"为什么我话没说完"。
+    pending_interrupt_note_ = truncator_.build_interrupt_note(r);
+    if (!pending_interrupt_note_.empty()) {
+        context_.set_task_state_summary(pending_interrupt_note_);
+    }
+
+    // 3) trace：截断比例是判断"播报是否太啰嗦"的关键信号 ——
+    //    大量截断说明回答比用户耐心长。
+    trace_event_("RESPONSE_TRUNCATED", r.played_text);
 }
 
 // ========== R8：可观测 ==========

@@ -253,6 +253,8 @@ set(CORE_SOURCES
     src/orchestrator/user_intent.cpp
     src/orchestrator/response_policy.cpp
     src/orchestrator/turn_admission.cpp
+    src/orchestrator/interruption_truncation.cpp
+    src/orchestrator/semantic_turn.cpp
     src/orchestrator/fast_response.cpp
     src/orchestrator/background_cache.cpp
     src/orchestrator/model_router.cpp

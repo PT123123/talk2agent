@@ -115,6 +115,15 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/test_model_router.cpp)
     voice_agent_test_copy_rt(test_model_router)
 endif()
 
+# R9 业界对标测试（打断截断 / 语义轮次判定 / 播放进度）
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/test_industry_alignment.cpp)
+    add_executable(test_industry_alignment test_industry_alignment.cpp)
+    target_link_libraries(test_industry_alignment PRIVATE voice_agent_core)
+    add_test(NAME test_industry_alignment COMMAND test_industry_alignment)
+    voice_agent_test_env(test_industry_alignment)
+    voice_agent_test_copy_rt(test_industry_alignment)
+endif()
+
 # R8 长跑稳定性测试（内存红线 / 线程泄漏 / 容器容量）
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/test_long_run.cpp)
     add_executable(test_long_run test_long_run.cpp)

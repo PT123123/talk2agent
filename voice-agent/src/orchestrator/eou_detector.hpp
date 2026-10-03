@@ -34,6 +34,12 @@ public:
     // 设置结束判定回调
     void set_callback(Callback cb);
 
+    // R9b：运行时调整阈值（语义轮次判定用它延长等待窗口）。
+    // 注意：只改 force_ms / fast_ms，不动已挂起的计时器 ——
+    // 已在等待中的那一次仍按旧阈值触发。
+    void set_config(const Config& c) { config_ = c; }
+    const Config& config() const { return config_; }
+
     // 通知语音开始
     void on_speech_start(uint64_t timestamp_us);
 

@@ -47,6 +47,20 @@ public:
     void set_fade_out_ms(int ms) { fade_out_ms_ = ms; }
     void set_fade_in_ms(int ms) { fade_in_ms_ = ms; }
 
+    // ---- 播放进度（打断时用来算"用户实际听到多少"）----
+    // 业界共识（OpenAI conversation.item.truncate / Azure auto_truncate）：
+    // 打断后必须让模型知道用户实际听到哪一段，否则它会以为没播的部分也说过，
+    // 下一轮基于错误前提推理 —— 这就是 context desync。
+    //
+    // 已推送的采样数（= 模型生成的总量）
+    int64_t total_frames_pushed() const { return total_frames_pushed_; }
+    // 已播放的采样数（= 用户实际听到的量）
+    int64_t total_frames_played() const { return total_frames_played_; }
+    // 播放比例 0~1。已推送但未播的部分就是被截断的内容。
+    double played_ratio() const;
+
+    void reset_progress();
+
 private:
     // 计算淡入淡出增益
     float compute_gain_(size_t frame_idx, size_t total_frames) const;
@@ -58,6 +72,10 @@ private:
     std::vector<int16_t> tts_buffer_;
     size_t tts_read_pos_ = 0;
     std::function<void()> fade_out_callback_;
+
+    // 播放进度统计（采样数）
+    int64_t total_frames_pushed_{0};
+    int64_t total_frames_played_{0};
 
     // 淡出状态
     bool fading_out_ = false;

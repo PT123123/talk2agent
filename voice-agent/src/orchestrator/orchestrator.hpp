@@ -37,6 +37,8 @@
 #include "tts/prosody.hpp"
 #include "tts/response_plan.hpp"
 #include "tts/tts_adapter.hpp"
+#include "orchestrator/interruption_truncation.hpp"
+#include "orchestrator/semantic_turn.hpp"
 #include "util/voice_trace.hpp"
 #include "util/latency_metrics.hpp"
 
@@ -72,6 +74,17 @@ struct OrchestratorConfig {
     bool enable_fast_response = true;
     // 抢答阈值：预计耗时超过它才先说一句。0 = 用 FastResponseLayer 默认值。
     int ack_threshold_ms = 700;
+
+    // ========== R9a：打断上下文同步 ==========
+    // 打断时把"用户实际听到的部分"记入对话历史，并告知模型它被打断了。
+    // 不做的话模型会以为没播的内容也说过 —— context desync。
+    bool enable_interrupt_truncation = true;
+
+    // ========== R9b：语义轮次判定 ==========
+    // 对标 OpenAI semantic_vad。中文建议 low（中文"话题在前评论在后"，
+    // 决定性信息常在句末）。
+    bool enable_semantic_turn = true;
+    Eagerness eagerness{Eagerness::Low};
 
     // ========== R8：可观测 ==========
     // 对话 trace 落盘路径（JSONL）。空 = 关闭（零开销）。
@@ -457,6 +470,9 @@ private:
     // R3：把可用的后台结果注入 ContextManager 的 P6 层（供本轮引用）。
     void inject_cached_results_(const std::string& user_text);
 
+    // R9a：打断时同步上下文 —— 记录用户实际听到的部分 + 告知模型被打断。
+    void sync_interrupted_context_();
+
     // R6：把 LLM 增量文本切成段、经韵律规划后送 TTS。
     // 替换原先的 stream_sentence_ 裸缓冲。
     void feed_speech_text_(const std::string& token);
@@ -483,6 +499,12 @@ private:
     int64_t turn_first_audio_ns_{0};
     std::atomic<bool> turn_interrupted_{false};
     double barge_in_start_ms_{0.0};   // R8：用户开口时刻（打断延迟基准）
+    // R9a：打断截断器
+    InterruptionTruncation truncator_;
+    // R9b：语义轮次判定
+    SemanticTurnDetector semantic_turn_;
+    // 上一轮被中断的说明（写进下一轮的 P2 任务状态层）
+    std::string pending_interrupt_note_;
     std::string turn_user_text_;
     std::string turn_ack_text_;
 };

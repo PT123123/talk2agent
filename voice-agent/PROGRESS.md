@@ -196,6 +196,16 @@
 | **遗留问题** | **barge-in 延迟的测量点不精确** —— 目前从 `on_vad_speech_start`（VAD 检测到语音）算起，而不是从用户实际开口算起。VAD 本身有 100~300ms 的检测延迟，所以这个指标**偏乐观**；真实值需要硬件级时间戳（R8 后续补）。**未做真实 1h/4h/8h 长跑** —— `test_long_run` 是加速版（同等操作量压缩到秒级），真实的长时间运行还需要：真实音频设备连续占用、模型常驻显存、真实网络请求。这三项都需要实际环境，当前无法在无 GPU/无音频的环境里验证。远程链路的连接池**未做真实验证**（需要 API key）；`pause_before_ms` 仍未被播放链路消费（见 R6 遗留） |
 | **文件** | `src/util/{voice_trace,latency_metrics}.{hpp,cpp}`, `src/util/http_winhttp.cpp`, `src/orchestrator/orchestrator.{hpp,cpp}`, `tests/test_long_run.cpp`, `CMakeLists.txt`, `tests/CMakeLists.txt` |
 
+### R9 - 业界对标补齐 ✅
+| 项目 | 内容 |
+|------|------|
+| **完成日期** | 2026-10-04 |
+| **完成内容** | 对标 OpenAI Realtime / Azure Voice Live / LiveKit / Pipecat / Krisp / Qwen-Audio / AWS Bedrock+Pipecat 等业界方案，补齐两处此前遗漏的关键能力，并产出《业界对标与设计依据》文档。①**打断上下文同步（Context Desync）** —— 本次最重要的发现。TTS 合成远快于播放，用户打断时模型往往已生成完整回答；若把完整文本写进历史，下一轮模型会**以为没播的内容也说过**（跳过用户没听到的解释、说"正如我刚才说的"）。OpenAI 社区将其列为该 API **最普遍的第一个生产 bug**。实现：`AudioRouter` 区分**已推送**（pushed）与**已播放**（played）两个计数（业界文档明确警告"scheduled audio overstates it"，我们把计数点放在真正交给声卡的 `get_playback_frames()`）；打断时在 `stop_playback()` **之前**取 `played_ratio()`，按比例截断且切点对齐句边界，把实际播出的记入 ContextManager，并构造"被打断"说明写进 P2 层（对应 Azure 的 `appended_text_after_truncation`，让模型知道自己为什么话没说完）。新增 `InterruptionTruncation`（纯逻辑，可精确单测）。②**语义轮次判定** —— 静音时长是**代理指标**而非目标：纯阈值同时有两个失败方向（"我想问一下…(停600ms)…那个项目" 抢话 / "好的" 慢半拍）。OpenAI 的 `semantic_vad` 用语义分类器 + `eagerness`（low/medium/high 超时 8s/4s/2s）。我们实现规则版 `SemanticTurnDetector`（接口与 LiveKit/Pipecat 的模型可替换点对齐），**默认值 Low** —— 中文是"话题在前评论在后"结构，决定性信息常在句末，Medium 会中途插话。**只延长等待不否决轮次**：语义判定只把 EOU 的 `force_ms` 临时拉长（900→8000ms），避免"文本取回再放回"的状态回滚竞态。③新增 `EOUDetector::set_config()` 支持运行时调阈值。 |
+| **验收结果** | ✅ MSVC `/W3` 零警告（修掉一处 char 截断警告 + 一处重复字符比较）；`test_industry_alignment` **10 组断言全部 PASS** —— 覆盖截断保留播放部分、几乎未播时整段丢弃、全播完不算截断、**打断标记**、段级截断、语义连接词/完整句判定、**"半句+900ms 停顿不抢话而 8000ms 必须兜底"**（这条正是对标的核心行为）、Eaginess 越低越保守（对齐 OpenAI 官方 8/4/2s）、AudioRouter 播放进度。`ctest` **15/15 通过** |
+| **文档** | 新增 `docs/业界对标与设计依据.md`：记录参考来源与关键结论、逐条对标（打断同步/语义轮次/抢答/延迟预算）、**明确未采纳项及原因**（语义 VAD 模型、端到端语音模型、WebRTC/SFU、说话人分离、IHBench 恢复评测、音频前置降噪）、以及**调参依据表**（每个数值的来源；改动前先查表，别凭感觉） |
+| **遗留问题** | 语义判定是**规则版**不是模型版（LiveKit 135M / Pipecat Smart Turn v3 的 ONNX 方案未接）—— 接口已留，换实现不改调用方；截断精度是**字符比例级**（误差在句级），若引擎提供 word timestamp 可精确到词；`eou_force_ms` 被拉长后**不会自动回落**（当前靠 `reset()` 路径重置），连续多轮"没说完"会累积放大延迟；**未做中文/英文的 EOU 阈值自适应**（中文语速快，同样的 900ms 间隔更短）；打断恢复能力（被打断后是否在正确步骤恢复、是否重发已听过的内容）无评测手段 —— IHBench 那类需要真人打断数据集 |
+| **文件** | `src/orchestrator/{interruption_truncation,semantic_turn}.{hpp,cpp}`, `src/orchestrator/{orchestrator,audio_router,eou_detector}.{hpp,cpp}`, `tests/test_industry_alignment.cpp`, `docs/业界对标与设计依据.md`, `CMakeLists.txt`, `tests/CMakeLists.txt` |
+
 ### M7 - MCP 集成
 | 项目 | 内容 |
 |------|------|
