@@ -47,8 +47,9 @@ bool looks_like_emotional_smalltalk(const std::string& s) {
     }
 
     // 纯主观陈述（无疑问词、无请求动词）也算倾诉
-    const bool has_question = s.find('？') != std::string::npos ||
-                              s.find('?') != std::string::npos ||
+    // 注意：全角'？' 是 3 字节 UTF-8，写成 '？' 会被截断成单字节 char，
+    // 永远匹配不上（MSVC C4305/C4309）。字符串字面量才不会被截。
+    const bool has_question = s.find('?') != std::string::npos ||
                               has_any(s, {"怎么", "如何", "为什么", "什么", "哪些",
                                           "吗", "呢", "?", "？", "how", "what", "why"});
     const bool has_request = has_any(s, {"帮我", "查一下", "看一下", "找一下", "搜",

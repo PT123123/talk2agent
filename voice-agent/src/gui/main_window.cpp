@@ -9,13 +9,13 @@
 #include <windows.h>
 #include <dwmapi.h>
 #pragma comment(lib, "dwmapi.lib")
-#include <QCheckBox>
 #include <QColor>
+#include <QCloseEvent>
 #include <QEvent>
 #include <QFileInfo>
 #include <QFont>
 #include <QFrame>
-#include <QGroupBox>
+#include <QGridLayout>
 #include <QHBoxLayout>
 #include <QHeaderView>
 #include <QKeyEvent>
@@ -27,10 +27,11 @@
 #include <QProgressBar>
 #include <QPushButton>
 #include <QScrollBar>
+#include <QScrollArea>
 #include <QSplitter>
 #include <QStackedWidget>
 #include <QTableWidget>
-#include <QTextBrowser>
+#include <QTabWidget>
 #include <QTextCursor>
 #include <QTimer>
 #include <QToolButton>
@@ -49,6 +50,100 @@ namespace {
 
 QString escHtml(QString s) {
     return s.toHtmlEscaped();
+}
+
+// ===== 全局暗色主题（Chat 深色风格：深灰分层、圆角、微分割线）=====
+// 施加在 central widget 上，级联到全部子控件；QMainWindow 自身在
+// Windows 11 下保持透明以透出 Mica 背板。基础调色板在 main.cpp 设置。
+QString appStylesheet() {
+    return QStringLiteral(R"(
+QWidget { font-family:'Segoe UI','Microsoft YaHei UI','Microsoft YaHei',sans-serif;
+          font-size:13px; color:#ececec; }
+
+/* ---- 侧栏 ---- */
+#leftSidebar { background:#171717; border-right:1px solid #2a2a2a; }
+#rightSidebar { background:#171717; border-left:1px solid #2a2a2a; }
+QLabel#brand { font-size:15px; font-weight:600; }
+QLabel#sectionLabel { color:#9b9b9b; font-size:11px; font-weight:bold; }
+QToolButton#sectionHeader { color:#9b9b9b; font-size:11px; font-weight:bold;
+                            text-align:left; padding:2px 4px; border:none; }
+QListWidget { background:transparent; border:none; font-size:13px; }
+QListWidget::item { border-radius:8px; padding:5px 8px; margin:1px 0; color:#d4d4d4; }
+QListWidget::item:hover { background:#262626; }
+QListWidget::item:selected { background:#333333; color:#ececec; }
+QPushButton#newChatBtn { background:#2f2f2f; border:1px solid #3d3d3d;
+                         border-radius:10px; padding:8px 10px; font-weight:600; }
+QPushButton#newChatBtn:hover { background:#3a3a3a; }
+QPushButton#sideNav { background:transparent; border:none; border-radius:8px;
+                      padding:8px 10px; text-align:left; color:#d4d4d4; }
+QPushButton#sideNav:hover { background:#262626; }
+
+/* ---- 对话页 ---- */
+#chatPage { background:#212121; }
+#chatHeader { background:#212121; border-bottom:1px solid #2c2c2c; }
+QLabel#pageTitle { font-size:15px; font-weight:600; }
+#statusPill { padding:3px 12px; border-radius:12px; background:#22324d;
+              color:#8ab4f8; font-weight:bold; }
+QScrollArea#chatScroll { background:#212121; border:none; }
+QWidget#chatHost { background:#212121; }
+#emptyState { color:#9a9a9a; font-size:14px; padding-top:72px; }
+QLabel#msgUser { background:#2f2f2f; border-radius:16px; padding:9px 14px; }
+QLabel#msgAssistant { background:transparent; color:#ececec; }
+QLabel#avatar { background:#10a37f; color:#ffffff; border-radius:12px;
+                font-weight:bold; font-size:11px; }
+
+/* ---- 输入卡 ---- */
+#composer { background:#2f2f2f; border:1px solid #3d3d3d; border-radius:22px; }
+QLineEdit#composerInput { background:transparent; border:none; font-size:14px; }
+QPushButton#sendBtn { background:#ffffff; color:#0d0d0d; border:none;
+                      border-radius:19px; font-size:16px; }
+QPushButton#sendBtn:hover { background:#e0e0e0; }
+QPushButton#sendBtn:pressed { background:#cccccc; }
+QPushButton#sendBtn:disabled { background:#3d3d3d; color:#7a7a7a; }
+QPushButton#iconBtn { background:transparent; border:none; border-radius:19px;
+                      font-size:16px; color:#b4b4b4; }
+QPushButton#iconBtn:hover { background:#3a3a3a; }
+QPushButton#iconBtn:checked { background:#22324d; color:#8ab4f8; }
+QToolButton#chipToggle { background:transparent; border:1px solid #3d3d3d;
+                         border-radius:12px; padding:3px 10px; color:#b4b4b4; }
+QToolButton#chipToggle:hover { background:#3a3a3a; }
+QToolButton#chipToggle:checked { background:#22324d; border-color:#2f4a73; color:#8ab4f8; }
+QLabel#composerHint { color:#6f6f6f; font-size:11px; }
+QFrame#initBanner { background:#1c2a40; border:1px solid #2f4a73; border-radius:12px; }
+
+/* ---- 右栏：模型/流程 chips、日志、耗时 ---- */
+QTabWidget::pane { border:none; background:transparent; }
+QTabBar::tab { background:transparent; color:#9b9b9b; padding:5px 12px;
+               border:none; border-bottom:2px solid transparent; }
+QTabBar::tab:selected { color:#ececec; border-bottom:2px solid #ececec; }
+QTabBar::tab:hover { color:#ececec; }
+QPlainTextEdit#logView { background:#1c1c1c; border:1px solid #2c2c2c;
+                         border-radius:10px; font-size:12px; color:#d4d4d4; }
+QTableWidget { background:transparent; border:none; font-size:12px; }
+QTableWidget::item { padding:2px; }
+QHeaderView::section { background:transparent; border:none;
+                       border-bottom:1px solid #2c2c2c; padding:3px;
+                       color:#9b9b9b; font-size:11px; }
+
+/* ---- 通用 ---- */
+QProgressBar { background:#3a3a3a; border:none; border-radius:4px; }
+QProgressBar::chunk { background:#7aaafc; border-radius:4px; }
+QToolButton { background:transparent; border:none; border-radius:8px;
+              padding:3px 7px; color:#b4b4b4; }
+QToolButton:hover { background:#2a2a2a; }
+QMenu { background:#2a2a2a; border:1px solid #3d3d3d; }
+QMenu::item { padding:5px 24px; border-radius:6px; }
+QMenu::item:selected { background:#3a3a3a; }
+QToolTip { background:#2a2a2a; color:#ececec; border:1px solid #3d3d3d;
+           padding:4px; }
+QScrollBar:vertical { background:transparent; width:8px; margin:2px; }
+QScrollBar::handle:vertical { background:#3d3d3d; border-radius:4px; min-height:24px; }
+QScrollBar::handle:vertical:hover { background:#4d4d4d; }
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height:0; }
+QScrollBar:horizontal { background:transparent; height:8px; margin:2px; }
+QScrollBar::handle:horizontal { background:#3d3d3d; border-radius:4px; min-width:24px; }
+QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width:0; }
+)");
 }
 
 // 流程阶段点标签
@@ -73,15 +168,19 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     setWindowTitle(QStringLiteral("Voice Agent — 本地全双工语音助手"));
     resize(1180, 760);
 
-    // ===== Windows 11 Mica 微光效果 =====
+    // ===== Windows 深色标题栏 + Windows 11 Mica 微光效果 =====
     {
         QOperatingSystemVersion os = QOperatingSystemVersion::current();
+        auto hwnd = reinterpret_cast<HWND>(winId());
+        // 深色标题栏（Win10 1809+ / Win11 通用；失败只是回退浅色，无副作用）
+        DWORD darkTitlebar = 1;
+        DwmSetWindowAttribute(hwnd, 20 /*DWMWA_USE_IMMERSIVE_DARK_MODE*/,
+                              &darkTitlebar, sizeof(darkTitlebar));
         bool isWin11 = (os.majorVersion() > 10) ||
                        (os.majorVersion() == 10 && os.minorVersion() >= 0 &&
                         os.microVersion() >= 22000);
         if (isWin11) {
             // 方式一：DWMWA_SYSTEMBACKDROP_TYPE（Windows 11 22H2+，推荐）
-            auto hwnd = reinterpret_cast<HWND>(winId());
             DWORD backdropType = 2; // 2 = Mica
             DwmSetWindowAttribute(hwnd, 38 /*DWMWA_SYSTEMBACKDROP_TYPE*/,
                                   &backdropType, sizeof(backdropType));
@@ -101,8 +200,14 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
 
     controller_ = new AgentController(this);
     connectSignals_();
-    controller_->start();
-    refreshMemoryList_();   // 启动后即拉取"共享记忆"分组内容
+
+    // 界面启动与重活分离：核心装配（config/模型/记忆/音频/状态机）在 AgentController
+    // 的 worker 线程做，且延后到首帧绘制之后启动；窗口先立即出现，期间为加载态。
+    // 任何磁盘 IO/设备枚举都不得出现在 GUI 线程的构造路径上。
+    QTimer::singleShot(0, this, [this] {
+        controller_->start();
+        refreshMemoryList_();   // 启动后即拉取"共享记忆"分组内容
+    });
 
     // 初始即处于加载态：禁用交互，等待首个进度信号
     setControlsEnabled_(false);
@@ -131,6 +236,7 @@ bool MainWindow::eventFilter(QObject* watched, QEvent* event) {
                         return false;
                     }
                     pttHolding_ = true;
+                    pttKeyDownSeen_ = true;
                     if (controller_->vadEnabled()) {
                         voiceBtn_->setChecked(true);   // 触发 onVoiceToggled(true) → startVoice
                     } else {
@@ -142,6 +248,7 @@ bool MainWindow::eventFilter(QObject* watched, QEvent* event) {
                 if (ke->isAutoRepeat()) return true;
                 if (pttHolding_) {
                     pttHolding_ = false;
+                    pttKeyDownSeen_ = false;
                     if (controller_->vadEnabled()) {
                         voiceBtn_->setChecked(false);  // 触发 onVoiceToggled(false) → stopVoice
                     } else {
@@ -155,6 +262,42 @@ bool MainWindow::eventFilter(QObject* watched, QEvent* event) {
     return QMainWindow::eventFilter(watched, event);
 }
 
+// ========== PTT 兜底释放 ==========
+// 按住空格后如果窗口失焦（Alt+Tab / 点别的程序 / 锁屏），key-up 事件
+// 不会回到这个进程，pttHolding_ 与麦克风占用就都卡住了。
+// 所以在窗口状态变化与关闭时都补一次幂等释放。
+
+void MainWindow::releasePtt_() {
+    if (!pttHolding_ && !pttKeyDownSeen_) return;
+    pttHolding_ = false;
+    pttKeyDownSeen_ = false;
+    if (!controller_) return;
+
+    // voiceBtn_ 在 VAD 模式下就是录音态高亮，必须一起取消，
+    // 否则界面显示"正在录音"但实际已经不在录。
+    if (controller_->vadEnabled()) {
+        QSignalBlocker b(voiceBtn_);
+        voiceBtn_->setChecked(false);
+        controller_->stopVoice();
+    } else {
+        controller_->stopVoice();
+    }
+    updateVadHint_();
+}
+
+void MainWindow::changeEvent(QEvent* event) {
+    if (event->type() == QEvent::WindowDeactivate ||
+        event->type() == QEvent::WindowStateChange) {
+        releasePtt_();
+    }
+    QMainWindow::changeEvent(event);
+}
+
+void MainWindow::closeEvent(QCloseEvent* event) {
+    releasePtt_();   // 别让麦克风被窗口关闭带着一起挂住
+    QMainWindow::closeEvent(event);
+}
+
 void MainWindow::buildUi_() {
     auto* central = new QWidget(this);
     auto* rootLayout = new QHBoxLayout(central);
@@ -164,7 +307,7 @@ void MainWindow::buildUi_() {
     buildLeftSidebar_();
     rootLayout->addWidget(leftSidebar_);
 
-    // 中栏 + 右栏（可折叠日志栏）
+    // 中栏 + 右栏（可折叠流程/日志栏）
     centerRightSplit_ = new QSplitter(Qt::Horizontal, central);
     centerStack_ = new QStackedWidget(centerRightSplit_);
     settings_ = new SettingsPanel(this);
@@ -178,9 +321,10 @@ void MainWindow::buildUi_() {
     centerRightSplit_->setStretchFactor(0, 1);
     centerRightSplit_->setStretchFactor(1, 0);
     centerRightSplit_->setSizes({860, 340});
-    centerRightSplit_->setHandleWidth(5);
+    centerRightSplit_->setHandleWidth(1);
 
     rootLayout->addWidget(centerRightSplit_, 1);
+    central->setStyleSheet(appStylesheet());   // 浅色主题级联全部子控件
     setCentralWidget(central);
 }
 
@@ -188,42 +332,29 @@ void MainWindow::buildUi_() {
 void MainWindow::buildLeftSidebar_() {
     leftSidebar_ = new QWidget(this);
     leftSidebar_->setObjectName("leftSidebar");
-    leftSidebar_->setMinimumWidth(205);
-    leftSidebar_->setMaximumWidth(330);
+    leftSidebar_->setMinimumWidth(220);
+    leftSidebar_->setMaximumWidth(300);
     auto* l = new QVBoxLayout(leftSidebar_);
-    l->setContentsMargins(8, 10, 8, 10);
-    l->setSpacing(6);
+    l->setContentsMargins(10, 14, 10, 12);
+    l->setSpacing(8);
 
-    auto* brandRow = new QHBoxLayout;
-    leftToggleBtn_ = new QToolButton(leftSidebar_);
-    leftToggleBtn_->setText(QStringLiteral("☰"));
-    leftToggleBtn_->setToolTip(QStringLiteral("折叠 / 展开左侧栏"));
-    leftToggleBtn_->setAutoRaise(true);
-    brandRow->addWidget(leftToggleBtn_);
     auto* brand = new QLabel(QStringLiteral("Voice Agent"), leftSidebar_);
-    QFont bf = brand->font();
-    bf.setBold(true);
-    bf.setPointSize(bf.pointSize() + 3);
-    brand->setFont(bf);
-    brandRow->addWidget(brand);
-    brandRow->addStretch(1);
-    l->addLayout(brandRow);
+    brand->setObjectName("brand");
+    l->addWidget(brand);
 
     newConvBtn_ = new QPushButton(QStringLiteral("＋ 新建对话"), leftSidebar_);
+    newConvBtn_->setObjectName("newChatBtn");
     newConvBtn_->setToolTip(QStringLiteral("新建一个对话（当前核心为单会话上下文，先建好结构留作扩展）"));
     l->addWidget(newConvBtn_);
 
     // 对话分组
     auto* convHeader = new QToolButton(leftSidebar_);
+    convHeader->setObjectName("sectionHeader");
     convHeader->setText(QStringLiteral("▾ 对话"));
     convHeader->setToolButtonStyle(Qt::ToolButtonTextOnly);
     convHeader->setCheckable(true);
     convHeader->setChecked(true);
     convHeader->setAutoRaise(true);
-    QFont gf = convHeader->font();
-    gf.setBold(true);
-    gf.setPointSize(gf.pointSize() - 1);
-    convHeader->setFont(gf);
     l->addWidget(convHeader);
     convList_ = new QListWidget(leftSidebar_);
     convList_->setFrameShape(QFrame::NoFrame);
@@ -235,12 +366,13 @@ void MainWindow::buildLeftSidebar_() {
 
     // 共享记忆分组
     auto* memHeader = new QToolButton(leftSidebar_);
+    memHeader->setObjectName("sectionHeader");
     memHeader->setText(QStringLiteral("▾ 共享记忆"));
     memHeader->setToolButtonStyle(Qt::ToolButtonTextOnly);
     memHeader->setCheckable(true);
     memHeader->setChecked(true);
     memHeader->setAutoRaise(true);
-    memHeader->setFont(gf);
+    memHeader->setFont(cf);
     l->addWidget(memHeader);
     memList_ = new QListWidget(leftSidebar_);
     memList_->setFrameShape(QFrame::NoFrame);
@@ -259,180 +391,237 @@ void MainWindow::buildLeftSidebar_() {
     l->addStretch(1);
 
     settingsNavBtn_ = new QPushButton(QStringLiteral("⚙  设置"), leftSidebar_);
+    settingsNavBtn_->setObjectName("sideNav");
     settingsNavBtn_->setAutoDefault(false);
     settingsNavBtn_->setToolTip(QStringLiteral("打开 / 返回 设置页"));
     l->addWidget(settingsNavBtn_);
 }
 
-// ========== 中栏：主对话区 ==========
+// ========== 中栏：主对话区（ChatGPT 式） ==========
 void MainWindow::buildChatPage_() {
     chatPage_ = new QWidget(this);
+    chatPage_->setObjectName("chatPage");
     auto* dlg = new QVBoxLayout(chatPage_);
-    dlg->setContentsMargins(16, 12, 16, 12);
-    dlg->setSpacing(8);
+    dlg->setContentsMargins(0, 0, 0, 0);
+    dlg->setSpacing(0);
 
-    // 标题行：当前对话名 + 右侧日志栏开关
-    auto* headerRow = new QHBoxLayout;
-    pageTitle_ = new QLabel(QStringLiteral("对话"), chatPage_);
-    QFont hf = pageTitle_->font();
-    hf.setBold(true);
-    hf.setPointSize(hf.pointSize() + 2);
-    pageTitle_->setFont(hf);
-    headerRow->addWidget(pageTitle_);
-    headerRow->addStretch(1);
-    rightToggleBtn_ = new QToolButton(chatPage_);
-    rightToggleBtn_->setText(QStringLiteral("⊟ 收起日志"));
+    // ---- 顶栏：左栏开关 + 会话标题 + 状态胶囊 + 右栏开关 ----
+    auto* header = new QFrame(chatPage_);
+    header->setObjectName("chatHeader");
+    header->setFixedHeight(46);
+    auto* hh = new QHBoxLayout(header);
+    hh->setContentsMargins(12, 6, 12, 6);
+    hh->setSpacing(10);
+    leftToggleBtn_ = new QToolButton(header);
+    leftToggleBtn_->setText(QStringLiteral("☰"));
+    leftToggleBtn_->setToolTip(QStringLiteral("折叠 / 展开左侧栏"));
+    leftToggleBtn_->setAutoRaise(true);
+    hh->addWidget(leftToggleBtn_);
+    pageTitle_ = new QLabel(QStringLiteral("对话"), header);
+    pageTitle_->setObjectName("pageTitle");
+    hh->addWidget(pageTitle_);
+    hh->addStretch(1);
+    statusLabel_ = new QLabel(QStringLiteral("正在加载…"), header);
+    statusLabel_->setObjectName("statusPill");
+    hh->addWidget(statusLabel_);
+    rightToggleBtn_ = new QToolButton(header);
+    rightToggleBtn_->setText(QStringLiteral("⊟"));
     rightToggleBtn_->setAutoRaise(true);
-    rightToggleBtn_->setToolTip(QStringLiteral("展开 / 收起右侧日志栏"));
-    headerRow->addWidget(rightToggleBtn_);
-    dlg->addLayout(headerRow);
+    rightToggleBtn_->setToolTip(QStringLiteral("展开 / 收起右侧流程与日志栏"));
+    hh->addWidget(rightToggleBtn_);
+    dlg->addWidget(header);
 
-    // 后台初始化（模型加载完成后隐藏）
-    initBox_ = new QGroupBox(QStringLiteral("初始化"), chatPage_);
-    auto* initLayout = new QVBoxLayout(initBox_);
+    // ---- 对话流：滚动区 + 气泡行 ----
+    chatScroll_ = new QScrollArea(chatPage_);
+    chatScroll_->setObjectName("chatScroll");
+    chatScroll_->setWidgetResizable(true);
+    chatScroll_->setFrameShape(QFrame::NoFrame);
+    chatScroll_->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    chatHost_ = new QWidget;
+    chatHost_->setObjectName("chatHost");
+    chatLayout_ = new QVBoxLayout(chatHost_);
+    chatLayout_->setContentsMargins(32, 20, 32, 12);
+    chatLayout_->setSpacing(14);
+    emptyState_ = new QLabel(QStringLiteral(
+        "👋 你好，我是你的本地语音助手\n\n"
+        "点击 🎙 开始语音对话，或直接在下方输入消息"), chatHost_);
+    emptyState_->setObjectName("emptyState");
+    emptyState_->setAlignment(Qt::AlignHCenter | Qt::AlignTop);
+    emptyState_->setWordWrap(true);
+    chatLayout_->addWidget(emptyState_);
+    chatLayout_->addStretch(1);
+    chatScroll_->setWidget(chatHost_);
+    connect(chatScroll_->verticalScrollBar(), &QScrollBar::valueChanged, this, [this](int) {
+        auto* sb = chatScroll_->verticalScrollBar();
+        stickToBottom_ = (sb->value() >= sb->maximum() - 4);
+    });
+    dlg->addWidget(chatScroll_, 1);
+
+    // ---- 底部输入区：初始化横幅 + 圆角输入卡 ----
+    auto* bottom = new QWidget(chatPage_);
+    auto* bl = new QVBoxLayout(bottom);
+    bl->setContentsMargins(28, 4, 28, 14);
+    bl->setSpacing(8);
+
+    initBox_ = new QFrame(bottom);
+    initBox_->setObjectName("initBanner");
+    auto* initLayout = new QHBoxLayout(initBox_);
+    initLayout->setContentsMargins(14, 10, 14, 10);
+    initLayout->setSpacing(12);
     loadLabel_ = new QLabel(QStringLiteral("正在准备…"), initBox_);
     loadLabel_->setWordWrap(true);
-    loadLabel_->setStyleSheet(QStringLiteral("color:#1a73e8;"));
+    loadLabel_->setStyleSheet(QStringLiteral("color:#8ab4f8;"));
+    initLayout->addWidget(loadLabel_, 1);
     loadProgress_ = new QProgressBar(initBox_);
     loadProgress_->setRange(0, 100);
     loadProgress_->setValue(0);
-    initLayout->addWidget(loadLabel_);
+    loadProgress_->setFixedWidth(180);
     initLayout->addWidget(loadProgress_);
-    dlg->addWidget(initBox_);
+    bl->addWidget(initBox_);
 
-    // 对话流
-    chat_ = new QTextBrowser(chatPage_);
-    chat_->setReadOnly(true);
-    chat_->document()->setDefaultStyleSheet(
-        "body{font-family:Segoe UI, Microsoft YaHei;font-size:13px;}");
-    connect(chat_->verticalScrollBar(), &QScrollBar::valueChanged, this, [this](int) {
-        auto* sb = chat_->verticalScrollBar();
-        stickToBottom_ = (sb->value() >= sb->maximum() - 4);
-    });
-    dlg->addWidget(chat_, 1);
+    auto* composer = new QFrame(bottom);
+    composer->setObjectName("composer");
+    auto* cv = new QVBoxLayout(composer);
+    cv->setContentsMargins(16, 10, 10, 10);
+    cv->setSpacing(6);
+    input_ = new QLineEdit(composer);
+    input_->setObjectName("composerInput");
+    input_->setPlaceholderText(
+        QStringLiteral("输入消息，回车发送（支持 /memory save|list|query|clear）…"));
+    input_->setMinimumHeight(26);
+    cv->addWidget(input_);
 
-    // 流式回答气泡（生成中显示于此，完成后并入对话流）
-    streamBubble_ = new QTextBrowser(chatPage_);
-    streamBubble_->setReadOnly(true);
-    streamBubble_->setFrameShape(QFrame::NoFrame);
-    streamBubble_->setStyleSheet(
-        "QTextBrowser{background:#f2f8f2;border:1px solid #d8e8d8;border-radius:10px;"
-        "padding:8px 12px;color:#1a1a1a;}");
-    streamBubble_->setVisible(false);
-    streamBubble_->setMaximumHeight(200);
-    dlg->addWidget(streamBubble_);
-
-    // 处理流程条
-    auto* stageBox = new QGroupBox(QStringLiteral("处理流程"), chatPage_);
-    stageBox->setMaximumHeight(60);
-    auto* stageRow = new QHBoxLayout(stageBox);
-    stageRow->setContentsMargins(8, 4, 8, 4);
-    stageRow->setSpacing(2);
-    for (int i = 0; i < kStageCount; ++i) {
-        if (i > 0) {
-            auto* arrow = new QLabel(QStringLiteral("→"), stageBox);
-            arrow->setStyleSheet(QStringLiteral("color:#aaa;"));
-            stageRow->addWidget(arrow);
-        }
-        stageDots_[i] = new QLabel(QString::fromUtf8(kStageLabels[i]), stageBox);
-        stageDots_[i]->setAlignment(Qt::AlignCenter);
-        stageDots_[i]->setStyleSheet(stagePlainStyle_());
-        stageRow->addWidget(stageDots_[i], 1);
-    }
-    resetPipeline_();
-    dlg->addWidget(stageBox);
-
-    // 控制行
     auto* ctrlRow = new QHBoxLayout;
-    ctrlRow->setSpacing(8);
-    voiceBtn_ = new QPushButton(QStringLiteral("开始语音"), chatPage_);
+    ctrlRow->setSpacing(6);
+    voiceBtn_ = new QPushButton(QStringLiteral("🎙"), composer);
+    voiceBtn_->setObjectName("iconBtn");
     voiceBtn_->setCheckable(true);
-    voiceBtn_->setMinimumWidth(96);
-    speakBtn_ = new QPushButton(QStringLiteral("🔊 朗读"), chatPage_);
+    voiceBtn_->setFixedSize(38, 38);
+    voiceBtn_->setToolTip(QStringLiteral("开始 / 停止语音（按住空格可即按即说）"));
+    speakBtn_ = new QPushButton(QStringLiteral("🔊"), composer);
+    speakBtn_->setObjectName("iconBtn");
+    speakBtn_->setFixedSize(38, 38);
     speakBtn_->setToolTip(QStringLiteral("朗读最近一次回复"));
-    ttsToggle_ = new QCheckBox(QStringLiteral("语音播报"), chatPage_);
+    ttsToggle_ = new QToolButton(composer);
+    ttsToggle_->setObjectName("chipToggle");
+    ttsToggle_->setText(QStringLiteral("播报"));
+    ttsToggle_->setCheckable(true);
     ttsToggle_->setChecked(true);
-    vadToggle_ = new QCheckBox(QStringLiteral("VAD"), chatPage_);
-    vadToggle_->setChecked(true);
-    vadToggle_->setToolTip(QStringLiteral("关闭后改为按住说话/点击按钮录音，结束即转写"));
-    statusLabel_ = new QLabel(QStringLiteral("待机（按住空格说话）"), chatPage_);
-    QFont sf = statusLabel_->font();
-    sf.setBold(true);
-    statusLabel_->setFont(sf);
-    statusLabel_->setStyleSheet(QStringLiteral("color:#1a73e8;"));
+    ttsToggle_->setToolTip(QStringLiteral("TTS 语音播报开关（关闭后仅显示文字）"));
+    vadToggle_ = new QToolButton(composer);
+    vadToggle_->setObjectName("chipToggle");
+    vadToggle_->setText(QStringLiteral("VAD"));
+    vadToggle_->setCheckable(true);
+    // 初始为关（= 手动按键，与 agent.yaml 的 input_mode: ptt 一致）。
+    // 控制器初始化完会按配置回填，这里只是让首帧不闪一下"开"。
+    vadToggle_->setChecked(false);
+    vadToggle_->setToolTip(QStringLiteral(
+        "关闭（默认）：按住空格/🎙 说话，松开即转写。\n"
+        "开启：麦克风常开，自动检测说话起止。\n"
+        "完整设置在「设置 → 播报与交互 → 语音输入方式」。"));
+    sendBtn_ = new QPushButton(QStringLiteral("➤"), composer);
+    sendBtn_->setObjectName("sendBtn");
+    sendBtn_->setFixedSize(38, 38);
+    sendBtn_->setToolTip(QStringLiteral("发送"));
     ctrlRow->addWidget(voiceBtn_);
     ctrlRow->addWidget(speakBtn_);
     ctrlRow->addWidget(ttsToggle_);
     ctrlRow->addWidget(vadToggle_);
-    ctrlRow->addWidget(statusLabel_, 1);
-    dlg->addLayout(ctrlRow);
+    ctrlRow->addStretch(1);
+    ctrlRow->addWidget(sendBtn_);
+    cv->addLayout(ctrlRow);
+    bl->addWidget(composer);
 
-    // 输入行
-    auto* inputRow = new QHBoxLayout;
-    inputRow->setSpacing(8);
-    input_ = new QLineEdit(chatPage_);
-    input_->setPlaceholderText(QStringLiteral("输入消息，回车发送（支持 /memory save|list|query|clear）…"));
-    input_->setMinimumHeight(38);
-    sendBtn_ = new QPushButton(QStringLiteral("发送"), chatPage_);
-    sendBtn_->setMinimumHeight(38);
-    inputRow->addWidget(input_, 1);
-    inputRow->addWidget(sendBtn_, 0);
-    dlg->addLayout(inputRow);
+    auto* hint = new QLabel(
+        QStringLiteral("回车发送 · 按住空格说话 · 语音状态见顶部胶囊 · 流程与日志在右栏"), bottom);
+    hint->setObjectName("composerHint");
+    hint->setAlignment(Qt::AlignHCenter);
+    bl->addWidget(hint);
+
+    dlg->addWidget(bottom);
 }
 
-// ========== 右栏：模型状态 + 日志 + 轮次耗时（可折叠） ==========
+// ========== 右栏：模型状态 + 处理流程 + 日志/耗时标签页（可折叠） ==========
 void MainWindow::buildRightSidebar_() {
     rightSidebar_ = new QWidget(this);
     rightSidebar_->setObjectName("rightSidebar");
     rightSidebar_->setMinimumWidth(300);
-    rightSidebar_->setMaximumWidth(470);
+    rightSidebar_->setMaximumWidth(440);
     auto* r = new QVBoxLayout(rightSidebar_);
-    r->setContentsMargins(8, 8, 8, 8);
+    r->setContentsMargins(12, 12, 12, 12);
     r->setSpacing(8);
 
     auto* mTitle = new QLabel(QStringLiteral("模型状态"), rightSidebar_);
-    QFont mf = mTitle->font();
-    mf.setBold(true);
-    mTitle->setFont(mf);
+    mTitle->setObjectName("sectionLabel");
     r->addWidget(mTitle);
     const char* cats[4] = {"VAD", "ASR", "TTS", "LLM"};
     for (int i = 0; i < 4; ++i) {
         modelChips_[i] = new QLabel(
             QStringLiteral("%1：—").arg(QLatin1String(cats[i])), rightSidebar_);
-        modelChips_[i]->setStyleSheet(
-            QStringLiteral("padding:2px 10px;border:1px solid #ccc;border-radius:10px;"
-                           "background:#f5f6f7;color:#666;"));
+        modelChips_[i]->setWordWrap(true);
+        modelChips_[i]->setStyleSheet(stagePlainStyle_());
         r->addWidget(modelChips_[i]);
     }
 
-    auto* toolsBox = new QGroupBox(QStringLiteral("工具 / 记忆 / 运行日志"), rightSidebar_);
-    auto* toolsLayout = new QVBoxLayout(toolsBox);
-    toolsView_ = new QPlainTextEdit(toolsBox);
-    toolsView_->setReadOnly(true);
-    toolsLayout->addWidget(toolsView_);
-    r->addWidget(toolsBox, 1);
+    // 处理流程：两行圆角 chips（采集 VAD ASR LLM / 工具 TTS 播放），常显
+    auto* pTitle = new QLabel(QStringLiteral("处理流程"), rightSidebar_);
+    pTitle->setObjectName("sectionLabel");
+    r->addWidget(pTitle);
+    auto* stageGrid = new QGridLayout;
+    stageGrid->setContentsMargins(0, 0, 0, 0);
+    stageGrid->setHorizontalSpacing(5);
+    stageGrid->setVerticalSpacing(5);
+    for (int i = 0; i < kStageCount; ++i) {
+        stageDots_[i] = new QLabel(QString::fromUtf8(kStageLabels[i]), rightSidebar_);
+        stageDots_[i]->setAlignment(Qt::AlignCenter);
+        stageDots_[i]->setStyleSheet(stagePlainStyle_());
+        stageGrid->addWidget(stageDots_[i], i / 4, i % 4);
+    }
+    r->addLayout(stageGrid);
+    resetPipeline_();
 
-    auto* timelineBox = new QGroupBox(QStringLiteral("轮次耗时"), rightSidebar_);
-    auto* tlLayout = new QVBoxLayout(timelineBox);
+    // 日志 / 耗时：标签页收纳
+    rightTabs_ = new QTabWidget(rightSidebar_);
+    rightTabs_->setDocumentMode(true);
+
+    auto* logPage = new QWidget(rightTabs_);
+    auto* logL = new QVBoxLayout(logPage);
+    logL->setContentsMargins(0, 6, 0, 0);
+    toolsView_ = new QPlainTextEdit(logPage);
+    toolsView_->setObjectName("logView");
+    toolsView_->setReadOnly(true);
+    toolsView_->setFrameShape(QFrame::NoFrame);
+    logL->addWidget(toolsView_);
+    rightTabs_->addTab(logPage, QStringLiteral("日志"));
+
+    auto* tlPage = new QWidget(rightTabs_);
+    auto* tlLayout = new QVBoxLayout(tlPage);
+    tlLayout->setContentsMargins(0, 6, 0, 0);
+    tlLayout->setSpacing(6);
     timelineSummary_ = new QLabel(QStringLiteral("完成一轮对话后，这里显示各处理阶段耗时。"),
-                                  timelineBox);
+                                  tlPage);
     timelineSummary_->setWordWrap(true);
-    timelineSummary_->setStyleSheet(QStringLiteral("color:#444;"));
-    timelineTable_ = new QTableWidget(timelineBox);
+    timelineSummary_->setStyleSheet(QStringLiteral("color:#b4b4b4;"));
+    timelineTable_ = new QTableWidget(tlPage);
     timelineTable_->setEditTriggers(QAbstractItemView::NoEditTriggers);
     timelineTable_->setColumnCount(2);
     timelineTable_->setHorizontalHeaderLabels(
         {QStringLiteral("阶段"), QStringLiteral("耗时 (ms)")});
     timelineTable_->horizontalHeader()->setSectionResizeMode(0, QHeaderView::Stretch);
     timelineTable_->horizontalHeader()->setSectionResizeMode(1, QHeaderView::ResizeToContents);
-    timelineTable_->setMaximumHeight(160);
-    timelineHist_ = new QLabel(timelineBox);
+    timelineTable_->verticalHeader()->setVisible(false);
+    timelineTable_->setShowGrid(false);
+    timelineTable_->setMaximumHeight(170);
+    timelineHist_ = new QLabel(tlPage);
     timelineHist_->setWordWrap(true);
-    timelineHist_->setStyleSheet(QStringLiteral("color:#888;"));
+    timelineHist_->setStyleSheet(QStringLiteral("color:#8a8a8a;font-size:11px;"));
     tlLayout->addWidget(timelineSummary_);
     tlLayout->addWidget(timelineTable_);
     tlLayout->addWidget(timelineHist_);
-    r->addWidget(timelineBox);
+    tlLayout->addStretch(1);
+    rightTabs_->addTab(tlPage, QStringLiteral("耗时"));
+
+    r->addWidget(rightTabs_, 1);
 }
 
 void MainWindow::connectSignals_() {
@@ -446,12 +635,14 @@ void MainWindow::connectSignals_() {
     connect(settingsNavBtn_, &QPushButton::clicked, this, &MainWindow::onSettingsNav_);
     connect(voiceBtn_, &QPushButton::toggled, this, &MainWindow::onVoiceToggled);
     connect(speakBtn_, &QPushButton::clicked, this, &MainWindow::onSpeakClicked);
-    connect(ttsToggle_, &QCheckBox::toggled, this, &MainWindow::onTtsToggled);
-    connect(vadToggle_, &QCheckBox::toggled, this, &MainWindow::onVadToggled);
+    connect(ttsToggle_, &QToolButton::toggled, this, &MainWindow::onTtsToggled);
+    connect(vadToggle_, &QToolButton::toggled, this, &MainWindow::onVadToggled);
     // 控制器侧 VAD 状态变化（如后台初始化完成后按配置回填）→ 同步复选框
+    // 与设置页单选按钮，三处 UI 保持同一个真相
     connect(controller_, &AgentController::vadEnabledChanged, this, [this](bool enabled) {
         QSignalBlocker b(vadToggle_);
         vadToggle_->setChecked(enabled);
+        settings_->setInputMode(enabled);
         updateVadHint_();
     });
 
@@ -468,6 +659,20 @@ void MainWindow::connectSignals_() {
     // 设置页 → TTS 语速/发音人（跨线程投递到 worker 处置并持久化）
     connect(settings_, &SettingsPanel::ttsParamsApplied, controller_,
             &AgentController::setTtsParams);
+
+    // 设置页 → 语音输入方式（VAD 自动 / 手动按键）。
+    // 走同一个 controller_->setVadEnabled，所以输入卡上的 VAD 芯片会跟着变，
+    // 反过来在芯片上点也会同步回设置页 —— 单选按钮与芯片是同一个开关。
+    connect(settings_, &SettingsPanel::inputModeApplied, this,
+            [this](bool vadEnabled) {
+                onVadToggled(vadEnabled);
+            });
+
+    // 设置页 → 打断门槛（最短语音时长 + 确认期音量）
+    connect(settings_, &SettingsPanel::bargeInSettingsApplied, controller_,
+            [this](bool enabled, int minMs, int duckPercent) {
+                controller_->setBargeInSettings(enabled, minMs, duckPercent);
+            });
 
     // 麦克风输入电平 → 调试面板（80ms 轮询 atomic，开销可忽略）
     levelTimer_ = new QTimer(this);
@@ -492,21 +697,21 @@ void MainWindow::connectSignals_() {
             &MainWindow::appendAssistantFinal_);
     connect(controller_, &AgentController::stateChanged, this, &MainWindow::onStateChanged_);
     connect(controller_, &AgentController::audioStarted, this, [this] {
-        voiceBtn_->setText(QStringLiteral("停止语音"));
+        QSignalBlocker b(voiceBtn_);
+        voiceBtn_->setChecked(true);   // 🎙 高亮录音态（不限触发来源）
         statusLabel_->setText(controller_->vadEnabled()
-                                 ? QStringLiteral("语音监听中（VAD 自动切分）")
-                                 : QStringLiteral("录音中（结束即转写）"));
+                                 ? QStringLiteral("监听中 · VAD 自动切分")
+                                 : QStringLiteral("录音中 · 结束即转写"));
         setPipelineStep_(0);
     });
     connect(controller_, &AgentController::audioStopped, this, [this] {
-        voiceBtn_->setText(QStringLiteral("开始语音"));
+        QSignalBlocker b(voiceBtn_);
+        voiceBtn_->setChecked(false);
         updateVadHint_();
     });
     connect(controller_, &AgentController::voicePlaying, this,
             [this](bool playing) {
                 speakBtn_->setEnabled(!playing);
-                speakBtn_->setText(playing ? QStringLiteral("播放中…")
-                                           : QStringLiteral("喇叭"));
                 if (playing) setPipelineStep_(5);
             });
     // 工具调用与"回复"分开：跳转到工具阶段 + 记入工具区
@@ -520,7 +725,7 @@ void MainWindow::connectSignals_() {
     connect(controller_, &AgentController::memoryList, this, &MainWindow::onMemoryList_);
     connect(controller_, &AgentController::logLine, this, &MainWindow::onLogLine_);
     connect(controller_, &AgentController::errorLine, this, [this](const QString& e) {
-        toolsView_->appendHtml(QStringLiteral("<span style='color:#c00;'>%1</span>")
+        toolsView_->appendHtml(QStringLiteral("<span style='color:#f28b82;'>%1</span>")
                             .arg(escHtml(e)));
     });
 
@@ -561,15 +766,24 @@ void MainWindow::onTtsToggled(bool checked) {
 
 void MainWindow::onVadToggled(bool checked) {
     controller_->setVadEnabled(checked);
+    // 芯片与设置页单选按钮是同一个开关，两边都要跟上
+    settings_->setInputMode(checked);
     updateVadHint_();
 }
 
 void MainWindow::updateVadHint_() {
-    if (controller_ && vadToggle_) {
-        const bool vad = controller_->vadEnabled();
-        statusLabel_->setText(vad ? QStringLiteral("待机（按住空格说话，VAD 自动切分）")
-                                  : QStringLiteral("待机（VAD 关闭：按住说话，结束即转写）"));
-    }
+    if (!controller_ || !vadToggle_) return;
+    const bool vad = controller_->vadEnabled();
+    statusLabel_->setText(statusTextFor_(QStringLiteral("Idle")));
+    vadToggle_->setToolTip(vad
+        ? QStringLiteral(
+            "当前：VAD 自动切分。\n"
+            "麦克风常开，检测到你开始说话就自动识别，说完自动转写。\n"
+            "Agent 播报时你开口即进入打断确认（超过门槛才真正停止）。")
+        : QStringLiteral(
+            "当前：手动按键。\n"
+            "按住空格或 🎙 才开始录音，松开立刻转写。\n"
+            "Agent 播报时按下立即打断（按键本身就是明确意图，不等门槛）。"));
 }
 
 // ========== 侧栏导航 / 对话 / 共享记忆 ==========
@@ -579,7 +793,7 @@ void MainWindow::refreshConversationBadges_() {
     for (int i = 0; i < convList_->count(); ++i) {
         auto* it = convList_->item(i);
         const bool active = (it == activeConvItem_);
-        it->setForeground(active ? QColor(0x1a, 0x73, 0xe8) : QColor(0x44, 0x44, 0x44));
+        it->setForeground(active ? QColor(0x8a, 0xb4, 0xf8) : QColor(0xc9, 0xc9, 0xc9));
         QFont f = it->font();
         f.setBold(active);
         it->setFont(f);
@@ -615,10 +829,7 @@ void MainWindow::onToggleLeft_() {
 }
 
 void MainWindow::onToggleRight_() {
-    const bool show = !rightSidebar_->isVisible();
-    rightSidebar_->setVisible(show);
-    rightToggleBtn_->setText(show ? QStringLiteral("⊟ 收起日志")
-                                  : QStringLiteral("⊞ 显示日志"));
+    rightSidebar_->setVisible(!rightSidebar_->isVisible());
 }
 
 void MainWindow::onSettingsNav_() {
@@ -639,7 +850,7 @@ void MainWindow::onMemoryList_(const QVariantList& items) {
     memList_->clear();
     if (items.isEmpty()) {
         auto* empty = new QListWidgetItem(QStringLiteral("（暂无记忆）"), memList_);
-        empty->setForeground(QColor(0x99, 0x99, 0x99));
+        empty->setForeground(QColor(0x73, 0x73, 0x73));
         empty->setFlags(empty->flags() & ~Qt::ItemIsSelectable);
         memList_->addItem(empty);
         return;
@@ -673,30 +884,78 @@ void MainWindow::onMemoryActivated_(QListWidgetItem* item) {
                              content);
 }
 
-// 在对话区追加一条带样式的消息；仅"贴底"模式下自动滚动到最新
-void MainWindow::appendChatBubble_(const QString& who, const QString& text,
-                                   const char* color, const char* icon) {
-    const QString body = escHtml(text).replace(QLatin1Char('\n'),
-                                               QStringLiteral("<br>"));
-    chat_->append(QStringLiteral(
-        "<p style='margin:2px 0;'>"
-        "<span style='color:%1;font-weight:bold;'>%2 %3</span></p>"
-        "<p style='margin:0 0 10px 0;padding:8px 10px;border-radius:6px;background:%4;color:#1a1a1a;'>%5</p>")
-        .arg(QString::fromUtf8(color),
-             QString::fromUtf8(icon),
-             escHtml(who),
-             QString::fromUtf8(color),
-             body));
-    // 用户手动滚到历史中间时不强制跳回；滚回底部后恢复跟随
-    if (stickToBottom_) {
-        auto* sb = chat_->verticalScrollBar();
+// ========== 对话流气泡 ==========
+
+// 把消息行插入到流末尾（空态与 stretch 之前），并按需贴底
+void MainWindow::insertChatRow_(QWidget* row) {
+    emptyState_->setVisible(false);
+    // 布局末尾固定为 [emptyState_, stretch]，消息插在它们之前
+    chatLayout_->insertWidget(qMax(0, chatLayout_->count() - 2), row);
+    scrollChatToBottom_();
+}
+
+void MainWindow::scrollChatToBottom_() {
+    if (!stickToBottom_) return;
+    // 气泡高度在布局事件后才稳定，贴底放到下一轮事件循环
+    QTimer::singleShot(0, this, [this] {
+        if (!stickToBottom_) return;
+        auto* sb = chatScroll_->verticalScrollBar();
         sb->setValue(sb->maximum());
+    });
+}
+
+// 用户消息：右侧灰底圆角气泡
+void MainWindow::createUserRow_(const QString& text) {
+    auto* row = new QWidget(chatHost_);
+    auto* h = new QHBoxLayout(row);
+    h->setContentsMargins(0, 0, 0, 0);
+    h->setSpacing(0);
+    auto* bubble = new QLabel(text, row);
+    bubble->setObjectName("msgUser");
+    bubble->setTextFormat(Qt::PlainText);
+    bubble->setWordWrap(true);
+    bubble->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    bubble->setSizePolicy(QSizePolicy::Maximum, QSizePolicy::Minimum);
+    const int maxW = qBound(320, chatScroll_->viewport()->width() * 7 / 10, 640);
+    bubble->setMaximumWidth(maxW);
+    h->addStretch(1);
+    h->addWidget(bubble);
+    insertChatRow_(row);
+}
+
+// 助手消息：左侧头像 + 全宽正文；返回正文标签供流式更新
+QLabel* MainWindow::createAssistantRow_() {
+    auto* row = new QWidget(chatHost_);
+    auto* h = new QHBoxLayout(row);
+    h->setContentsMargins(0, 0, 0, 0);
+    h->setSpacing(10);
+    auto* avatar = new QLabel(QStringLiteral("AI"), row);
+    avatar->setObjectName("avatar");
+    avatar->setFixedSize(24, 24);
+    avatar->setAlignment(Qt::AlignCenter);
+    auto* label = new QLabel(row);
+    label->setObjectName("msgAssistant");
+    label->setTextFormat(Qt::PlainText);
+    label->setWordWrap(true);
+    label->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    label->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Minimum);
+    h->addWidget(avatar, 0, Qt::AlignTop);
+    h->addWidget(label, 1);
+    insertChatRow_(row);
+    return label;
+}
+
+void MainWindow::appendChatBubble_(const QString& text, bool isUser) {
+    if (isUser) {
+        createUserRow_(text);
+    } else {
+        createAssistantRow_()->setText(text);
     }
 }
 
 void MainWindow::onUserMessage_(const QString& text, bool fromVoice) {
     resetLive_();
-    appendChatBubble_(QStringLiteral("我"), text, "#1a73e8", "●");
+    appendChatBubble_(text, /*isUser=*/true);
     if (fromVoice) {
         // 语音轮：采集/VAD/ASR 已由 stageTiming 实时点亮，直接推进到 LLM
         setPipelineStep_(3);
@@ -710,21 +969,24 @@ void MainWindow::onUserMessage_(const QString& text, bool fromVoice) {
 void MainWindow::appendToken_(const QString& token) {
     const bool first = pendingAssistant_.isEmpty();
     pendingAssistant_ += token;
-    streamBubble_->setPlainText(pendingAssistant_);
-    streamBubble_->setVisible(true);
-    streamBubble_->moveCursor(QTextCursor::End);
-    streamBubble_->ensureCursorVisible();
+    if (!streamingLabel_) streamingLabel_ = createAssistantRow_();
+    streamingLabel_->setText(pendingAssistant_);
+    scrollChatToBottom_();
     if (first) LOG_INFO("SA_LIVE first token arrived, len=%d", token.size());
 }
 
 void MainWindow::appendAssistantFinal_(const QString& finalText) {
-    // 若已有流式累积，以累积文本提交；否则回退到最终文本
+    // 流式已在对话流里生成气泡：只需收尾；无流式时回退到最终文本
+    const bool streamed = streamingLabel_ != nullptr;
     const QString text = pendingAssistant_.isEmpty() ? finalText : pendingAssistant_;
-    if (text.isEmpty()) return;
-    appendChatBubble_(QStringLiteral("助手"), text, "#0f7b0f", "◆");
+    streamingLabel_ = nullptr;
     pendingAssistant_.clear();
-    streamBubble_->clear();
-    streamBubble_->setVisible(false);
+    if (streamed) {
+        scrollChatToBottom_();
+        return;
+    }
+    if (text.isEmpty()) return;
+    appendChatBubble_(text, /*isUser=*/false);
 }
 
 void MainWindow::onModelsApplied_(const ModelPaths& paths) {
@@ -746,6 +1008,9 @@ void MainWindow::onLoadStage_(int step, int total, const QString& label) {
     loadProgress_->setValue(step);
     initBox_->show();
     statusLabel_->setText(QStringLiteral("正在加载…"));
+    statusLabel_->setStyleSheet(QStringLiteral("padding:3px 12px;border-radius:12px;"
+                                               "background:#22324d;color:#8ab4f8;"
+                                               "font-weight:bold;"));
     setControlsEnabled_(false);
     if (!loadTimer_->isActive()) loadTimer_->start();
     updateLoadLabel_();
@@ -755,9 +1020,13 @@ void MainWindow::onLoadFinished_(bool ok) {
     loading_ = false;
     loadTimer_->stop();
     initBox_->hide();
-    statusLabel_->setText(ok ? QStringLiteral("待机（按住空格说话）")
-                             : QStringLiteral("初始化异常（详见日志）"));
-    statusLabel_->setStyleSheet(QStringLiteral("color:#1a73e8;"));
+    statusLabel_->setText(ok ? QStringLiteral("待机 · 按住空格说话")
+                             : QStringLiteral("初始化异常 · 详见右栏日志"));
+    statusLabel_->setStyleSheet(ok
+        ? QStringLiteral("padding:3px 12px;border-radius:12px;background:#22324d;"
+                         "color:#8ab4f8;font-weight:bold;")
+        : QStringLiteral("padding:3px 12px;border-radius:12px;background:#3d1f22;"
+                         "color:#f28b82;font-weight:bold;"));
     setControlsEnabled_(true);
 }
 
@@ -777,11 +1046,11 @@ void MainWindow::setControlsEnabled_(bool enabled) {
     sendBtn_->setEnabled(enabled);
 }
 
-// ========== 流程阶段条 ==========
+// ========== 流程阶段条（右栏两行 chips） ==========
 
 QString MainWindow::stagePlainStyle_() const {
-    return QStringLiteral("padding:2px 8px;border-radius:10px;"
-                          "background:#ececec;color:#bbb;font-weight:bold;");
+    return QStringLiteral("padding:3px 8px;border-radius:10px;font-size:11px;"
+                          "background:#2a2a2a;color:#6f6f6f;font-weight:bold;");
 }
 
 void MainWindow::resetPipeline_() {
@@ -799,17 +1068,17 @@ void MainWindow::setPipelineState_(int idx, int state) {
     QString style;
     switch (state) {
         case kStageActive:
-            style = QStringLiteral("padding:2px 8px;border-radius:10px;"
-                                   "background:#fde293;color:#b06000;font-weight:bold;");
+            style = QStringLiteral("padding:3px 8px;border-radius:10px;font-size:11px;"
+                                   "background:#3d2f14;color:#f0b26b;font-weight:bold;");
             break;
         case kStageDone:
-            style = QStringLiteral("padding:2px 8px;border-radius:10px;"
-                                   "background:#e6f4ea;color:#188038;font-weight:bold;");
+            style = QStringLiteral("padding:3px 8px;border-radius:10px;font-size:11px;"
+                                   "background:#1e2f24;color:#6dd58c;font-weight:bold;");
             break;
         case kStageSkipped:
             label += QStringLiteral("·跳过");
-            style = QStringLiteral("padding:2px 8px;border-radius:10px;border:1px dashed #ccc;"
-                                   "background:#fafafa;color:#bbb;");
+            style = QStringLiteral("padding:3px 8px;border-radius:10px;font-size:11px;"
+                                   "border:1px dashed #3d3d3d;background:transparent;color:#5f5f5f;");
             break;
         default:
             style = stagePlainStyle_();
@@ -884,36 +1153,37 @@ void MainWindow::onModelStatus(const QVariantMap& models) {
             : QStringLiteral(" · 加载 %1ms").arg(loadMs, 0, 'f', 1);
 
         QString status;          // 中文状态词
-        QString style;
+        QString baseStyle =
+            QStringLiteral("padding:5px 10px;border-radius:10px;color:#ececec;");
         if (state == QLatin1String("loading")) {
             status = QStringLiteral("加载中");
-            style = QStringLiteral("padding:2px 10px;border:1px solid #f0c674;"
-                                   "border-radius:10px;background:#fdf3d8;color:#9a6b00;");
+            baseStyle += QStringLiteral("border:1px solid #6b5a2a;background:#352c14;");
         } else if (state == QLatin1String("ready") && !realBackend) {
             // 模块"就绪"了但真实模型文件缺失（Mock 占位不推理），明确提示
             status = QStringLiteral("缺失(Mock)");
-            style = QStringLiteral("padding:2px 10px;border:1px solid #e0b0a0;"
-                                   "border-radius:10px;background:#fbece7;color:#a33;");
+            baseStyle += QStringLiteral("border:1px solid #6b3a2f;background:#34201b;");
         } else if (state == QLatin1String("ready")) {
             status = QStringLiteral("就绪");
-            style = QStringLiteral("padding:2px 10px;border:1px solid #cce8d4;"
-                                   "border-radius:10px;background:#e6f4ea;color:#188038;");
+            baseStyle += QStringLiteral("border:1px solid #2f4a38;background:#1e2f24;");
         } else {
             status = QStringLiteral("未加载");
-            style = QStringLiteral("padding:2px 10px;border:1px dashed #ccc;"
-                                   "border-radius:10px;background:#f5f6f7;color:#999;");
+            baseStyle += QStringLiteral("border:1px solid #3d3d3d;background:#262626;color:#9b9b9b;");
         }
 
-        QString chip = QStringLiteral("%1：%2")
-                           .arg(QLatin1String(keys[i]), status);
+        QString chip = QStringLiteral("<b>%1</b> · %2")
+                           .arg(QLatin1String(keys[i]), escHtml(status));
         if (!disp.isEmpty())
-            chip += QStringLiteral(" · %1").arg(disp);
+            chip += QStringLiteral(" · %1").arg(escHtml(disp));
         if (realBackend && !provider.isEmpty() && provider != QLatin1String("Mock"))
-            chip += QStringLiteral(" · %1").arg(provider);
-        if (loadMs > 0 || bytes > 0)
-            chip += QStringLiteral(" · %1 · %2%3").arg(file, sizeTxt, loadTxt);
+            chip += QStringLiteral(" · %1").arg(escHtml(provider));
+        if (loadMs > 0 || bytes > 0) {
+            chip += QStringLiteral(
+                        "<br><span style='color:#9b9b9b;font-size:11px;'>%1 · %2%3</span>")
+                        .arg(escHtml(file), sizeTxt, loadTxt);
+        }
+        modelChips_[i]->setTextFormat(Qt::RichText);
         modelChips_[i]->setText(chip);
-        modelChips_[i]->setStyleSheet(style);
+        modelChips_[i]->setStyleSheet(baseStyle);
         modelChips_[i]->setToolTip(x.isEmpty()
             ? QStringLiteral("尚未上报状态")
             : QStringLiteral("后端：%1\n推理：%2\n型号：%3\n文件：%4\n占用：%5\n加载耗时：%6 ms")
@@ -928,12 +1198,57 @@ void MainWindow::onModelStatus(const QVariantMap& models) {
 
 // ========== 时间轴 ==========
 
+QString MainWindow::statusTextFor_(const QString& state) const {
+    // 状态机内部用的是英文枚举名，直接显示给用户等于把实现细节漏出去。
+    // 这里翻成中文，并补上"这一轮发生过什么"的信息 ——
+    // 光说"正在听你说"分不清是正常轮次开始，还是用户刚打断了 Agent。
+    const bool vad = controller_ && controller_->vadEnabled();
+
+    if (state == QLatin1String("Listening")) {
+        if (turnWasInterrupted_) {
+            // 打断路径：状态是 Interrupting → Listening 立刻切回来的
+            return vad ? QStringLiteral("正在听你说（已打断当前回答）")
+                       : QStringLiteral("正在录音（已打断当前回答）");
+        }
+        return vad ? QStringLiteral("正在听你说…")
+                   : QStringLiteral("正在录音…松开即转写");
+    }
+    if (state == QLatin1String("EouPending"))
+        return QStringLiteral("正在判断是否说完…");
+    if (state == QLatin1String("Thinking"))
+        return QStringLiteral("正在思考…");
+    if (state == QLatin1String("Speaking"))
+        return controller_ && controller_->ttsEnabled()
+                   ? QStringLiteral("正在播报 · 按住空格可打断")
+                   : QStringLiteral("正在生成（播报已关闭）");
+    if (state == QLatin1String("Interrupting"))
+        return QStringLiteral("已停止回答");
+    if (state == QLatin1String("Idle"))
+        return controller_ && controller_->vadEnabled()
+                   ? QStringLiteral("待机 · 按住空格可打断")
+                   : QStringLiteral("待机 · 按住空格说话");
+    return state;   // 未知状态：原样透传，不猜
+}
+
 void MainWindow::onStateChanged_(const QString& state) {
-    statusLabel_->setText(state);
-    statusLabel_->setStyleSheet(
-        state == QStringLiteral("Thinking") || state == QStringLiteral("Speaking")
-            ? QStringLiteral("color:#e37400;")
-            : QStringLiteral("color:#1a73e8;"));
+    if (state == QLatin1String("Interrupting")) {
+        turnWasInterrupted_ = true;
+    } else if (state == QLatin1String("Thinking")) {
+        // 新的回答轮次开始，标记复位
+        turnWasInterrupted_ = false;
+    } else if (state == QLatin1String("Idle")) {
+        // 回到空闲说明这一轮彻底结束了，下次打断不该再显示"已打断"
+        turnWasInterrupted_ = false;
+    }
+
+    statusLabel_->setText(statusTextFor_(state));
+    const bool busy = (state == QStringLiteral("Thinking") ||
+                       state == QStringLiteral("Speaking"));
+    statusLabel_->setStyleSheet(busy
+        ? QStringLiteral("padding:3px 12px;border-radius:12px;background:#3d2f14;"
+                         "color:#f0b26b;font-weight:bold;")
+        : QStringLiteral("padding:3px 12px;border-radius:12px;background:#22324d;"
+                         "color:#8ab4f8;font-weight:bold;"));
 
     if (state == QLatin1String("Listening")) {
         resetLive_();
@@ -996,7 +1311,7 @@ void MainWindow::refreshTimelineTable_() {
         auto* it = new QTableWidgetItem(liveActive_
             ? QStringLiteral("本轮处理中…")
             : QStringLiteral("等待一轮对话"));
-        it->setForeground(QColor(0x99, 0x99, 0x99));
+        it->setForeground(QColor(0x73, 0x73, 0x73));
         timelineTable_->setItem(0, 0, it);
         timelineTable_->setItem(0, 1, new QTableWidgetItem(QString()));
         timelineSummary_->setText(liveActive_ ? QStringLiteral("本轮处理中…")

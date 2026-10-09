@@ -16,10 +16,13 @@ vad:
 
 # ===== 打断配置 =====
 barge_in:
-  min_ms: 160                  # 最小打断时长
+  min_ms: 160                  # 打断门槛：用户开口后需持续这么久才真正打断
+                              # （低于此时长视为咳嗽/咂嘴，Agent 继续说完）
   backchannel_max_ms: 600      # 附和词最大时长
   coherence_max: 0.6          # AEC 相干性阈值
-  fade_out_ms: 40              # 淡出时长
+  fade_out_ms: 40              # 打断时播报淡出时长（避免硬切爆音）
+  duck_volume: 0.35            # 门槛等待期间 Agent 音量比例（0~1）
+  require_threshold: true      # false = 开口即打断（不推荐）
 
 # ===== EOU（End of Utterance）配置 =====
 eou:
@@ -32,6 +35,14 @@ vad_model: models/vad/silero_vad.onnx
 asr_model: models/asr/paraformer-zh
 tts_model: models/tts/kokoro-multi-lang-v1_0
 llm_model: models/llm/qwen2.5-1.5b-instruct-q4_k_m.gguf
+
+# ===== 语音输入方式 =====
+# ptt  = 手动按键（默认）：按住空格/🎙 说话，松开即转写。
+#        VAD 常开会一直占着音频设备，且环境噪声容易被当成人声；
+#        手动按键的"想说什么才按下"更可预测。
+# vad  = 麦克风常开，VAD 自动切分语音段，说完自动转写
+# 界面上「设置 → 播报与交互 → 语音输入方式」改这里，两边同步。
+input_mode: ptt
 
 # ===== 搜索配置 =====
 search:
@@ -55,3 +66,35 @@ remote_llm:
 # ===== 日志配置 =====
 log_level: info               # trace, debug, info, warn, error
 log_file: logs/voice-agent.log
+
+# ===== §24：韵律适配器选择（TTS "怎么说" 的那一层）=====
+# auto         = 按引擎类型自动（SAPI→系统语音适配器，模型引擎→Kokoro/Piper 适配器）
+# qwen3tts     = Qwen3-TTS 风格适配器（自然语言 instruction + speed）
+# chatterbox   = Chatterbox 风格适配器（exaggeration + cfg_weight + speed）
+tts_prosody_adapter: auto
+
+# ===== §24：PyTorch TTS 引擎（qwen3tts / chatterbox）=====
+# 这两个引擎没有原生 C++ 推理后端，推理跑在独立 Python 进程里：
+#     python scripts/tts_bridge_server.py --engine qwen3tts --port 8770
+# 启动后 instruction / exaggeration / cfg_weight 才会真正被模型消费。
+# **bridge 探测失败时自动回退到系统语音(SAPI)，不会导致整个 TTS 不可用**，
+# 只会退化成"只有 speed 生效"。
+tts_bridge_endpoint: "http://127.0.0.1:8770"
+tts_bridge_timeout_ms: 30000        # 首次合成要加载权重，给足时间
+tts_bridge_health_timeout_ms: 1500  # 健康探测必须快，否则卡住启动流程
+
+# ===== ZipVoice：零样本音色克隆（纯 CPU INT8，24kHz）=====
+# 本机（Intel Arc 2GB）上唯一能实时跑的中文神经 TTS：
+#   权重 156MB（INT8），实测 RTF 0.26~0.61（2 线程 CPU，比实时快），
+#   不碰显存，因此绕开了 Kokoro 在 Intel Arc 上 DirectML 崩溃的老问题。
+# 与其它引擎的区别：音色不靠"发音人 ID"，而是**参考音频 + 其逐字转写**。
+# 两者必须来自同一段音频，不匹配时克隆音质会明显下降。
+zipvoice:
+  # vocos 声码器不随模型包分发（所有音色共用），必须单独下载
+  vocoder: "models/tts/vocos_24khz.onnx"
+  # 参考音频：留空则用模型自带的 news-female.wav 示例音
+  # 换成自己的录音时，ref_text 必须是那段音频的**逐字**转写
+  ref_audio: ""
+  ref_text: ""
+  num_steps: 4                # 4=官方推荐；2 更快但音质下降；6+ 线性变慢不值
+  guidance_scale: 1.5

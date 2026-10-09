@@ -12,6 +12,8 @@ class QGridLayout;
 class QTabWidget;
 class QSlider;
 class QSpinBox;
+class QCheckBox;
+class QRadioButton;
 
 namespace voice_agent {
 namespace gui {
@@ -45,9 +47,18 @@ signals:
     void audioDeviceApplied(const QString& deviceName); // 应用麦克风设备（空 = 默认）
     void ttsParamsApplied(double speed, double pitch, int speakerId); // 应用 TTS 语速/发音人
 
+    // 语音输入方式：true = VAD 自动切分；false = 手动按键（PTT）
+    void inputModeApplied(bool vadEnabled);
+
+    // 打断门槛：enabled=false 时退回“开口即打断”
+    void bargeInSettingsApplied(bool enabled, int minSpeechMs, int duckPercent);
+
 public slots:
     // 由外部定时刷新输入电平（dBFS）
     void setInputLevel(float db);
+
+    // 外部状态回填（避免设置面板与输入卡上的 VAD 开关各说各话）
+    void setInputMode(bool vadEnabled);
 
 private:
     void buildModelTab_();
@@ -55,6 +66,8 @@ private:
     void buildBehaviorTab_();
     void buildAudioTab_();
     void refreshAudioDevices_();
+    // 输入方式单选切换（带QSignalBlocker 之外的显式同步，避免递归）
+    void onInputModeSelected_();
     struct Row {
         ModelCategory category;
         QComboBox* installed = nullptr;   // “当前使用”下拉（本地已存在）
@@ -87,6 +100,16 @@ private:
     QSlider* ttsSpeedSlider_ = nullptr;
     QLabel* ttsSpeedValue_ = nullptr;
     QSpinBox* ttsSpeakerSpin_ = nullptr;
+
+    // 语音输入方式（VAD 自动 / 手动按键）
+    QRadioButton* inputVad_ = nullptr;
+    QRadioButton* inputPtt_ = nullptr;
+
+    // 打断门槛
+    QCheckBox* bargeThresholdOn_ = nullptr;
+    QSpinBox* bargeMinSpeechSpin_ = nullptr;
+    QSlider* bargeDuckSlider_ = nullptr;
+    QLabel* bargeDuckValue_ = nullptr;
 };
 
 }  // namespace voice_agent::gui

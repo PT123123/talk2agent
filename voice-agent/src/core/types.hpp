@@ -205,6 +205,15 @@ struct AppConfig {
     int backchannel_max_ms{600};
     float coherence_max{0.6f};
     int fade_out_ms{40};
+    // 打断确认期间 Agent 的音量比例（0~1）。用户开口但未达门槛时先压低，
+    // 避免双方同音量互相盖住。0.35 = 压到三分之一。
+    float interrupt_duck_volume{0.35f};
+    // 是否启用打断门槛。false = 开口即打断（咳嗽也会掐掉回答，不推荐）。
+    bool barge_in_require_threshold{true};
+    // 语音输入方式："vad"=VAD 自动切分；"ptt"=按住空格/🎙 说话，松开转写。
+    // 默认 ptt（手动按键）：VAD 常开麦克风意味着一直占着音频设备，
+    // 且环境噪声会被当成人声；手动按键的"想说什么才按下"更可预测。
+    std::string input_mode{"ptt"};
 
     // EOU 参数
     int eou_fast_ms{350};
@@ -216,12 +225,31 @@ struct AppConfig {
     std::string asr_model;
     std::string tts_model;
     std::string llm_model;
-    std::string tts_engine{"simple"};  // "simple"=系统语音(SAPI,默认)；"kokoro"=本地Kokoro模型
+    std::string tts_engine{"simple"};  // "simple"=系统语音(SAPI,默认)；"kokoro"=本地Kokoro模型；
+                                       // "qwen3tts"/"chatterbox"=PyTorch 引擎（走本地 Python bridge）
 
     // TTS 语音参数（语速/音调/发音人）
     float tts_speed{1.0f};        // 语速倍率（0.5~2.0）
     float tts_pitch{1.0f};        // 音调倍率（保留字段，Kokoro 当前未参与生成）
     int tts_speaker_id{45};       // 发音人 ID（Kokoro 多语言 45=zf_xiaobei 中文女声）
+
+    // §24：韵律适配器选择（"auto"=按引擎自动；"qwen3tts"/"chatterbox"=对应风格适配器）
+    std::string tts_prosody_adapter{"auto"};
+
+    // §24：PyTorch TTS 引擎的本地 Python bridge（仅 qwen3tts/chatterbox 用）
+    std::string tts_bridge_endpoint{"http://127.0.0.1:8770"};
+    int tts_bridge_timeout_ms{30000};       // 首次合成要加载权重，给足时间
+    int tts_bridge_health_timeout_ms{1500}; // 健康探测必须快，否则卡住启动
+
+    // ZipVoice（零样本音色克隆，纯 CPU INT8）
+    // vocoder 不随模型包分发（所有音色共用），单独配。
+    std::string tts_zipvoice_vocoder{"models/tts/vocos_24khz.onnx"};
+    // 参考音频与其**逐字**转写。留空则用模型自带的示例参考音。
+    // 二者必须严格对应，不匹配时克隆音质会明显下降。
+    std::string tts_ref_audio;
+    std::string tts_ref_text;
+    int tts_num_steps{4};                   // 4=官方推荐；2 更快但音质降
+    float tts_guidance_scale{1.5f};
 
     // 搜索
     std::string searxng_url{"http://localhost:8080"};
@@ -243,6 +271,22 @@ struct AppConfig {
 
     // 记忆（M6）
     std::string memory_db_path{"memory.db"};
+
+    // ========== Conversation Runtime 开关（会传给 Orchestrator）==========
+    // 打断时把"用户实际听到的部分"记入历史并告知模型被打断。
+    // 不做的话模型会以为没播的内容也说过 —— context desync。
+    bool enable_interrupt_truncation{true};
+    // 语义轮次判定（对标 OpenAI semantic_vad）。中文建议 low。
+    bool enable_semantic_turn{true};
+    // Eagerness 档位："low"(8s) / "medium"(4s) / "high"(2s)。
+    // 以字符串存放，避免 core 层反向依赖 orchestrator/semantic_turn.hpp
+    // （Eagerness 定义在那里）。默认 low：中文"话题在前评论在后"，
+    // 决定性信息常在句末，medium 容易在句中抢话。
+    std::string eagerness{"low"};
+    // 对话 trace 落盘路径（JSONL）。空 = 关闭（零开销）。
+    std::string trace_path;
+    // 延迟指标聚合（仅内存）
+    bool enable_metrics{true};
 
     // 日志
     std::string log_level{"info"};

@@ -2,6 +2,8 @@
 #include "orchestrator.hpp"
 #include "util/log.hpp"
 #include "orchestrator/model_engines.hpp"
+#include "tts/qwen3_tts_adapter.hpp"
+#include "tts/chatterbox_adapter.hpp"
 #include <cctype>
 #include <cstring>
 #include <chrono>
@@ -70,7 +72,12 @@ Orchestrator::Orchestrator(Config config)
           /*eagerness*/config.eagerness,
           /*short_utterance_chars*/6})
 {
-    // 后台任务结果一律入 cache / WorkingContext，绝不主动抢话播报。
+    // 打断门槛的两个标量在构造函数体里赋值：它们声明在 vad_enabled_ 附近，
+    // 早于 truncator_/semantic_turn_，放进初始化列表会触发 /W3 的重排警告。
+    interrupt_duck_volume = config.interrupt_duck_volume;
+    barge_in_require_threshold = config.barge_in_require_threshold;
+
+    // 后台任务结果一律入cache / WorkingContext，绝不主动抢话播报。
     // 播报与否由上层按 turn 上下文决定 —— 这里只负责"结果有地方放"。
     tasks_.set_result_sink([this](const TaskId& id, const TaskOutcome& outcome) {
         absorb_background_result_(id, outcome);
@@ -118,11 +125,12 @@ bool Orchestrator::initialize(
         });
     }
 
-    // AudioRouter 淡出回调
-    audio_router_.set_fade_out_callback([this]() {
-        on_barge_in_detected();
-    });
+    // AudioRouter 打断淡出：fade_out_ms 内把缓冲尾巴淡到 0，避免硬切爆音。
+    // （原先这里挂的是 fade_out_callback → on_barge_in_detected，但 AudioRouter
+    //  从不触发淡出，那个回调是死代码；打断实际由 on_vad_speech_start 直接调用。）
     audio_router_.set_fade_out_ms(config_.fade_out_ms);
+    audio_router_.set_output_rate(
+        tts_ ? tts_->config().sample_rate : config_.playback_sample_rate);
 
     // R4：把现有 LLM 包装成引擎注册到各档位。
     // 同一个本地模型可以服务多档 —— 靠采样参数区分（详见 ModelRouter）。
@@ -142,15 +150,30 @@ bool Orchestrator::initialize(
     }
 
     // R6：按实际引擎建 TTS 适配器 —— SAPI 的参数能力与 Kokoro 不同。
+    // §24：prosody_adapter 显式指定风格适配器（qwen3tts / chatterbox）时优先采用，
+    // 否则按引擎类型自动选（SAPI→SapiTtsAdapter，模型引擎→ModelTtsAdapter）。
     if (tts_) {
-        tts_adapter_ = tts_->simple_engine()
-                           ? std::static_pointer_cast<ITtsAdapter>(
-                                 std::make_shared<SapiTtsAdapter>(tts_.get()))
-                           : std::static_pointer_cast<ITtsAdapter>(
-                                 std::make_shared<ModelTtsAdapter>(tts_.get()));
-        LOG_INFO("TTS adapter: {} (full prosody={})",
+        // 注意读的是 **requested** 引擎而不是 config().engine：
+        // bridge 探测失败时 TTS::initialize 会把 engine 就地降级成 "simple"，
+        // 但用户配的仍是 qwen3tts，韵律语义应当按 qwen3tts 理解
+        // （instruction 照算，只是最终由 SAPI 发声）。
+        const std::string requested = tts_->requested_engine();
+        const std::string pa = tts_->config().prosody_adapter;
+        if (pa == "qwen3tts" || requested == "qwen3tts") {
+            tts_adapter_ = std::make_shared<Qwen3TtsAdapter>(tts_.get());
+        } else if (pa == "chatterbox" || requested == "chatterbox") {
+            tts_adapter_ = std::make_shared<ChatterboxAdapter>(tts_.get());
+        } else {
+            tts_adapter_ = tts_->simple_engine()
+                               ? std::static_pointer_cast<ITtsAdapter>(
+                                     std::make_shared<SapiTtsAdapter>(tts_.get()))
+                               : std::static_pointer_cast<ITtsAdapter>(
+                                     std::make_shared<ModelTtsAdapter>(tts_.get()));
+        }
+        LOG_INFO("TTS adapter: {} (full prosody={}, engine={}, voice={})",
                  tts_adapter_->name(),
-                 tts_adapter_->supports_full_prosody() ? "yes" : "no");
+                 tts_adapter_->supports_full_prosody() ? "yes" : "no",
+                 tts_->engine_name(), tts_->provider_label());
     }
 
     LOG_INFO("Orchestrator initialized");
@@ -241,16 +264,24 @@ void Orchestrator::start() {
             if (vad_enabled_.load() && vad_) {
                 vad_->process(pcm_16k.data(), pcm_16k.size());
             }
+
+            // 打断门槛轮询：音频回调是唯一稳定的周期性入口（每 10ms 一次），
+            // 放这里才能在 duck 期间判断"用户是否已经说了够久"。
+            if (barge_in_pending_.load()) poll_barge_in_threshold_();
         });
 
         // 注册 AudioPipeline 播放回调（从 AudioRouter 拉取 TTS 音频）
         audio_pipeline_->set_playback_callback([this](int16_t* data, size_t frames) {
             if (audio_router_.is_playing()) {
                 if (!audio_router_.get_playback_frames(data, frames)) {
-                    // 播放完毕，切回 Idle
+                    // 缓冲放完：可能是自然播完，也可能是打断淡出走完。
+                    // 只有还在 Speaking 才是"自然播完"—— 打断路径已经把状态
+                    // 推到 Interrupting → Listening，此时再 enter_idle_()
+                    // 会把用户正在说话的轮次直接踢回 Idle（表现为mic 停了）。
+                    const bool natural_end = (state_.load() == State::Speaking);
                     audio_router_.stop_playback();
                     std::memset(data, 0, frames * sizeof(int16_t));
-                    enter_idle_();
+                    if (natural_end) enter_idle_();
                 }
             } else {
                 std::memset(data, 0, frames * sizeof(int16_t));
@@ -304,6 +335,9 @@ void Orchestrator::stop() {
     speech_buffer_.clear();
     eou_detector_.reset();
     smart_turn_.reset();
+    // 会话停了也要撤掉 duck，否则下次 start() 接手的是被压低的音量
+    barge_in_pending_.store(false);
+    barge_in_confirmed_.store(false);
     audio_router_.stop_playback();
 
     LOG_INFO("Orchestrator stopped");
@@ -330,13 +364,71 @@ void Orchestrator::on_vad_speech_start(uint64_t timestamp_us) {
     eou_detector_.on_speech_start(timestamp_us);
     smart_turn_.user_speech_start(timestamp_us);
 
-    // 如果 Agent 正在说话，用户开麦即为打断：立即取消 LLM、停 TTS 与清空待播音频。
-    // （原先依赖 smart_turn 智能判断误判率高且打断动作从未真正触发——真正的
-    //   停止动作在 on_barge_in_detected/淡出回调，而 AudioRouter 从不触发淡出。）
+    // Agent 正在播报时用户开口 —— 这是"用户在尝试插话"的信号。
+    //
+    // 旧实现是开口即 interrupt_agent_()，结果咳嗽/咂嘴/"嗯"这类短促音
+    // 也会把回答掐掉，而 barge_in_min_ms 这个配置对打断路径完全没有作用
+    //（SmartTurn::evaluate_barge_in 全仓库零调用点）。
+    //
+    // 现在改为：先 duck 音量 + 计时，持续到 barge_in_min_ms 才真打断。
+    // 门槛未到就结束语音（见 on_vad_speech_end）则放弃，音量复原。
     if (s == State::Speaking && smart_turn_.is_agent_speaking()) {
-        barge_in_start_ms_ = now_ms();   // R8：打断计时起点
-        interrupt_agent_();
+        barge_in_start_ms_ = now_ms();   // R8：打断延迟计时起点
+        if (barge_in_require_threshold && config_.barge_in_min_ms > 0) {
+            barge_in_pending_.store(true);
+            barge_in_confirmed_.store(false);
+            barge_in_pending_start_ms_ = now_ms();
+            audio_router_.set_output_gain(interrupt_duck_volume);
+            LOG_DEBUG("Barge-in pending: duck to {:.2f}, wait {} ms",
+                      static_cast<double>(interrupt_duck_volume),
+                      config_.barge_in_min_ms);
+        } else {
+            interrupt_agent_();
+        }
     }
+}
+
+bool Orchestrator::poll_barge_in_threshold_() {
+    if (!barge_in_pending_.load()) return false;
+    if (state_.load() != State::Speaking) {
+        // 状态已经被别的事件推走（回答自然播完/ 已被取消），门槛作废
+        cancel_barge_in_pending_();
+        return false;
+    }
+    if (now_ms() - barge_in_pending_start_ms_ < config_.barge_in_min_ms) {
+        return false;   // 还没到门槛，继续 duck
+    }
+    barge_in_confirmed_.store(true);
+    barge_in_pending_.store(false);
+    audio_router_.set_output_gain(1.0f);   // 确认要停了，音量不必再压
+    interrupt_agent_();
+    return true;
+}
+
+void Orchestrator::cancel_barge_in_pending_() {
+    if (!barge_in_pending_.exchange(false)) return;
+    audio_router_.set_output_gain(1.0f);
+    LOG_DEBUG("Barge-in cancelled: speech too short (<{} ms)",
+              config_.barge_in_min_ms);
+}
+
+void Orchestrator::set_barge_in_threshold(bool enabled, int min_ms,
+                                          float duck_volume) {
+    // min_ms <= 0 视作"不要门槛"，避免 GUI 传 0 后卡在永远打不断的状态
+    barge_in_require_threshold = enabled && min_ms > 0;
+    config_.barge_in_min_ms = std::max(0, min_ms);
+    interrupt_duck_volume = std::clamp(duck_volume, 0.0f, 1.0f);
+    // 门槛被关小/ 关掉时，正在等待的打断立即按新规则裁决
+    if (!barge_in_require_threshold) {
+        cancel_barge_in_pending_();
+    } else if (barge_in_pending_.load()) {
+        poll_barge_in_threshold_();
+    }
+    // 注意：这里不能直接把 const char* 传给 LOG_*，fmt 会把它当成格式串
+    // 再解析一遍（"on"/"off" 不是合法格式串 → C3615）。包一层 std::string。
+    LOG_INFO("Barge-in threshold: {} (min {} ms, duck {:.2f})",
+             std::string(barge_in_require_threshold ? "on" : "off"),
+             config_.barge_in_min_ms, static_cast<double>(interrupt_duck_volume));
 }
 
 void Orchestrator::on_vad_speech_end(uint64_t timestamp_us) {
@@ -352,6 +444,12 @@ void Orchestrator::on_vad_speech_end(uint64_t timestamp_us) {
 
     eou_detector_.on_vad_end(timestamp_us);
     smart_turn_.user_speech_end(timestamp_us);
+
+    // 语音段结束但门槛还没到 → 这是咳嗽/咂嘴/"嗯"，不是插话。
+    // 放弃打断并把音量复原，让 Agent 把话说完。
+    if (barge_in_pending_.load() && !barge_in_confirmed_.load()) {
+        cancel_barge_in_pending_();
+    }
 
     std::vector<int16_t> seg;
     seg.swap(speech_buffer_);
@@ -370,9 +468,13 @@ void Orchestrator::begin_capture() {
     State s = state_.load();
     if (s == State::Idle || s == State::Listening) enter_listening_();
 
-    // 手动对讲（VAD 关闭）：Agent 正在播报时按下对讲同样视为打断，
+    // 按键是明确意图，不需要等门槛。若此前 VAD 侧正在 duck 等待，先撤掉。
+    cancel_barge_in_pending_();
+
+    // 手动对讲（VAD 关闭）：Agent 正在播报时按下对讲即打断，
     // 立即停止当前 LLM 与语音播报，避免"界面已打断但声音仍在响"。
     if (s == State::Speaking && smart_turn_.is_agent_speaking()) {
+        barge_in_start_ms_ = now_ms();   // R8：打断延迟计时起点
         interrupt_agent_();
     }
 }
@@ -447,6 +549,10 @@ void Orchestrator::interrupt_agent_() {
 
     LOG_WARN("Barge-in detected, interrupting agent");
 
+    // 打断成立，撤掉 duck（若正在等待门槛）与相关状态
+    barge_in_pending_.store(false);
+    audio_router_.set_output_gain(1.0f);
+
     // R8：打断响应延迟 —— 从用户开口到停声完成。
     // 实施计划里的硬指标是 <250ms，这里是可观测的实测值。
     turn_interrupted_.store(true);
@@ -478,10 +584,11 @@ void Orchestrator::interrupt_agent_() {
     if (session_token_) session_token_->cancel();
 
     if (llm_) llm_->stop();
-    if (tts_) {
-        tts_->stop();
-        audio_router_.stop_playback();
-    }
+    // 先停合成，再淡出播放：tts_->stop() 之后不再有新帧，
+    // request_fade_out_stop() 把已缓冲的尾巴在 fade_out_ms 内淡到 0。
+    // （顺序反了会边淡边补；AudioRouter 也会直接丢弃淡出期间的新帧兜底。）
+    if (tts_) tts_->stop();
+    audio_router_.request_fade_out_stop();
 
     // R6：丢弃还没播出去的段，避免打断后残留半句。
     // 正在播的那段会被 stop() 掐断，清掉整份计划最干净 ——

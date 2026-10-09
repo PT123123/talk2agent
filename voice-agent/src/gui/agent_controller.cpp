@@ -22,6 +22,7 @@
 #include <QVariantList>
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 // SEH（__try/__except、EXCEPTION_EXECUTE_HANDLER、GetExceptionCode）所需声明。
 // 只引 excpt.h，不引 windows.h，避免 min/max 宏污染 Qt/std 代码。
@@ -107,12 +108,46 @@ std::string resolve_model(const QString& sel, const std::string& def,
     return prefix + "/" + def;
 }
 
-// 探测 TTS 模型目录类型："kokoro"（含 voices.bin）/ "piper"（含 espeak-ng-data + onnx）/ 空
+// 探测 TTS 模型目录类型：
+//   "kokoro"（含 voices.bin）
+//   "piper"（含 espeak-ng-data + onnx）
+//   "zipvoice"（含 encoder.*.onnx + decoder.*.onnx —— 注意它也有 espeak-ng-data，
+//              所以必须**先**判zipvoice，否则会被误认成 piper）
+//   空
 std::string detect_tts_engine(const std::string& dir) {
     if (dir.empty()) return {};
     std::error_code ec;
     if (std::filesystem::exists(dir + "/voices.bin", ec)) return "kokoro";
+    // ZipVoice 的 encoder/decoder 文件名带量化后缀（encoder.int8.onnx 等），
+    // 所以要 glob 匹配而不是写死 "encoder.onnx"。
+    const bool has_encoder =
+        std::filesystem::exists(dir + "/encoder.int8.onnx", ec) ||
+        std::filesystem::exists(dir + "/encoder.onnx", ec) ||
+        std::filesystem::exists(dir + "/encoder.q8.onnx", ec);
+    if (has_encoder &&
+        (std::filesystem::exists(dir + "/decoder.int8.onnx", ec) ||
+         std::filesystem::exists(dir + "/decoder.onnx", ec))) {
+        return "zipvoice";
+    }
     if (std::filesystem::exists(dir + "/espeak-ng-data", ec)) return "piper";
+    return {};
+}
+
+// ZipVoice：定位参考音频（test_wavs/ 下任选一个 wav）。
+// 真实使用应该由用户指定自己的音频；这里给模型自带的中文参考音作为默认。
+std::string find_zipvoice_ref_wav(const std::string& dir) {
+    if (dir.empty()) return {};
+    std::error_code ec;
+    for (const auto& e : std::filesystem::directory_iterator(dir, ec)) {
+        if (e.is_regular_file(ec) && e.path().extension() == ".wav")
+            return e.path().string();
+    }
+    // 兼容把参考音频放在 test_wavs/ 子目录里的打包方式
+    const std::string sub = dir + "/test_wavs";
+    for (const auto& e : std::filesystem::directory_iterator(sub, ec)) {
+        if (e.is_regular_file(ec) && e.path().extension() == ".wav")
+            return e.path().string();
+    }
     return {};
 }
 
@@ -137,12 +172,50 @@ TTSConfig tts_config_for_dir(const std::string& dir, const AppConfig& cfg) {
     tc.pitch = cfg.tts_pitch;
     tc.speaker_id = cfg.tts_speaker_id;
     const std::string eng = detect_tts_engine(dir);
+    tc.prosody_adapter = cfg.tts_prosody_adapter;
+    tc.bridge_endpoint = cfg.tts_bridge_endpoint;
+    tc.bridge_timeout_ms = cfg.tts_bridge_timeout_ms;
+    tc.bridge_health_timeout_ms = cfg.tts_bridge_health_timeout_ms;
+
+    // PyTorch 引擎（qwen3tts / chatterbox）：不用 sherpa-onnx 的本地权重，
+    // 识别权重目录也没有意义（推理在 Python 进程里）。直接按配置透传，
+    // TTS::initialize 会探测 bridge，不可用时自动回退到 SAPI。
+    if (cfg.tts_engine == "qwen3tts" || cfg.tts_engine == "chatterbox") {
+        tc.engine = cfg.tts_engine;
+        // 适配器跟随引擎：显式配了 auto 就用引擎对应的风格适配器，
+        // 否则用户只改引擎却拿不到 instruction/exaggeration 会很费解。
+        if (tc.prosody_adapter == "auto" || tc.prosody_adapter.empty())
+            tc.prosody_adapter = cfg.tts_engine;
+        return tc;
+    }
+
     if (eng == "piper") {
         // Piper(VITS)：<voice>.onnx + tokens.txt + espeak-ng-data
         tc.engine = "piper";
         tc.model_path = find_piper_onnx(dir);
         tc.tokens_path = dir + "/tokens.txt";
         tc.data_dir = dir + "/espeak-ng-data";
+    } else if (eng == "zipvoice") {
+        // ZipVoice：encoder + decoder + 独立 vocoder + tokens/lexicon/espeak
+        // vocoder 不在模型目录里（所有音色共用），路径可配。
+        std::error_code fec;
+        tc.engine = "zipvoice";
+        tc.zipvoice_encoder = dir + "/encoder.int8.onnx";
+        if (!std::filesystem::exists(tc.zipvoice_encoder, fec))
+            tc.zipvoice_encoder = dir + "/encoder.onnx";
+        tc.zipvoice_decoder = dir + "/decoder.int8.onnx";
+        if (!std::filesystem::exists(tc.zipvoice_decoder, fec))
+            tc.zipvoice_decoder = dir + "/decoder.onnx";
+        tc.zipvoice_vocoder = cfg.tts_zipvoice_vocoder;
+        tc.tokens_path = dir + "/tokens.txt";
+        tc.lexicon = dir + "/lexicon.txt";
+        tc.data_dir = dir + "/espeak-ng-data";
+        tc.ref_audio_path = cfg.tts_ref_audio.empty()
+                                ? find_zipvoice_ref_wav(dir)
+                                : cfg.tts_ref_audio;
+        tc.ref_text = cfg.tts_ref_text;
+        tc.num_steps = cfg.tts_num_steps;
+        tc.guidance_scale = cfg.tts_guidance_scale;
     } else if (eng == "kokoro") {
         // Kokoro：model.onnx + voices.bin + tokens.txt + espeak-ng-data
         tc.engine = "kokoro";
@@ -192,7 +265,8 @@ struct AgentController::Impl {
     std::shared_ptr<TTSSpeaker> speaker;
     std::shared_ptr<StreamingSpeaker> stream_speaker;   // 文本链路流式播报（边生成边播）
     ModelPaths activeModels;   // 当前实际启用的模型（相对 models/ 或空）
-    bool tts_enabled{true};
+    // atomic：GUI 线程要读它来决定状态栏文案（"正在播报" vs "正在生成"）
+    std::atomic<bool> tts_enabled{true};
 
     // 模型状态机信息（key ∈ {LLM,VAD,ASR,TTS}）
     struct ModelInfo {
@@ -312,6 +386,18 @@ void AgentController::setTtsParams(double speed, double pitch, int speakerId) {
     cv_.notify_all();
 }
 
+void AgentController::setBargeInSettings(bool enabled, int minSpeechMs,
+                                         int duckPercent) {
+    Task t;
+    t.type = TaskType::SetBargeIn;
+    t.flag = enabled;
+    t.ival = std::max(0, minSpeechMs);
+    t.d0 = std::max(0, std::min(100, duckPercent)) / 100.0;
+    std::lock_guard<std::mutex> lk(mtx_);
+    queue_.push_back(std::move(t));
+    cv_.notify_all();
+}
+
 void AgentController::setAudioDevice(const QString& deviceName) {
     Task t;
     t.type = TaskType::SetAudioDevice;
@@ -331,6 +417,10 @@ void AgentController::requestMemoryList() {
 float AgentController::inputLevelDb() const {
     if (!impl_ || !impl_->audio) return -96.0f;
     return impl_->audio->last_input_level_db();
+}
+
+bool AgentController::ttsEnabled() const {
+    return impl_ ? impl_->tts_enabled.load() : true;
 }
 
 void AgentController::threadMain_() {
@@ -449,6 +539,9 @@ void AgentController::initCore_() {
         emit logLine("VOICE_AGENT_NO_AUDIO=1：跳过音频管道与 Orchestrator 装配（诊断模式）。");
     } else {
         impl->audio = createAudioPipeline_();
+        // input_mode 要在 buildOrchestrator_ 之前落到 atomic 上：
+        // 那里会用 vad_enabled_.load() 去调 orch->set_vad_enabled()。
+        vad_enabled_.store(impl->cfg.input_mode != "ptt");
         impl->orch = buildOrchestrator_(impl->audio);
     }
 
@@ -670,6 +763,7 @@ void AgentController::handleTask_(const Task& task) {
         case TaskType::SetTts:      handleSetTts_(task.flag); break;
         case TaskType::SetTtsParams: handleSetTtsParams_(task.d0, task.d1, task.ival); break;
         case TaskType::SetVad:      handleSetVad_(task.flag); break;
+        case TaskType::SetBargeIn:   handleSetBargeIn_(task.flag, task.ival, task.d0); break;
         case TaskType::ListMemory: handleListMemory_(); break;
         default: break;
     }
@@ -964,10 +1058,32 @@ void AgentController::handleSetTtsParams_(double speed, double pitch, int speake
 
 void AgentController::handleSetVad_(bool enabled) {
     vad_enabled_.store(enabled);
+    if (impl_) impl_->cfg.input_mode = enabled ? "vad" : "ptt";
     if (impl_ && impl_->orch) impl_->orch->set_vad_enabled(enabled);
+    if (impl_) persistConfig_();
     emit vadEnabledChanged(enabled);
     emit logLine(enabled ? QStringLiteral("VAD 端点检测已开启（自动切分语音段）。")
-                         : QStringLiteral("VAD 已关闭：改为按住说话/点击按钮录音，ASR 直接接管。"));
+                         : QStringLiteral("已切换为手动按键：按住空格/🎙 说话，松开转写。"));
+}
+
+void AgentController::handleSetBargeIn_(bool enabled, int minSpeechMs,
+                                        double duckRatio) {
+    if (!impl_) return;
+    const float duck = static_cast<float>(std::clamp(duckRatio, 0.0, 1.0));
+    impl_->cfg.barge_in_require_threshold = enabled;
+    impl_->cfg.barge_in_min_ms = std::max(0, minSpeechMs);
+    impl_->cfg.interrupt_duck_volume = duck;
+
+    if (impl_->orch) {
+        impl_->orch->set_barge_in_threshold(enabled, minSpeechMs, duck);
+    }
+    persistConfig_();
+    emit bargeInSettingsChanged(enabled, minSpeechMs,
+                                static_cast<int>(duck * 100));
+    emit logLine(enabled
+        ? QStringLiteral("打断门槛：最短语音 %1 ms，等待期间音量 %2%。")
+              .arg(minSpeechMs).arg(static_cast<int>(duck * 100))
+        : QStringLiteral("打断门槛已关闭：开口即打断（咳嗽也可能掐掉回答）。"));
 }
 
 void AgentController::persistConfig_() {
@@ -1007,6 +1123,24 @@ void AgentController::persistConfig_() {
         set_scalar("tts_speed", std::to_string(impl_->cfg.tts_speed));
         set_scalar("tts_pitch", std::to_string(impl_->cfg.tts_pitch));
         set_scalar("tts_speaker_id", std::to_string(impl_->cfg.tts_speaker_id));
+        set_scalar("input_mode", impl_->cfg.input_mode);
+
+        // barge_in 段内的短 key（min_ms 等）必须限定在该分组里改——
+        // 全局搜 "min_ms:" 有可能命中别处的同名字段。定位规则见
+        // util/config.hpp 的 yaml_edit::set_in_group（那里有单测覆盖）。
+        char duckBuf[32];
+        std::snprintf(duckBuf, sizeof(duckBuf), "%.2f",
+                      static_cast<double>(impl_->cfg.interrupt_duck_volume));
+        changed |= yaml_edit::set_in_group(
+            text, "barge_in", "min_ms", std::to_string(impl_->cfg.barge_in_min_ms));
+        changed |= yaml_edit::set_in_group(
+            text, "barge_in", "fade_out_ms", std::to_string(impl_->cfg.fade_out_ms));
+        changed |= yaml_edit::set_in_group(
+            text, "barge_in", "duck_volume", std::string(duckBuf));
+        changed |= yaml_edit::set_in_group(
+            text, "barge_in", "require_threshold",
+            impl_->cfg.barge_in_require_threshold ? "true" : "false");
+
         if (changed) {
             std::ofstream out(path, std::ios::trunc);
             out << text;
@@ -1060,7 +1194,28 @@ std::shared_ptr<AudioPipeline> AgentController::createAudioPipeline_() {
 
 std::shared_ptr<Orchestrator> AgentController::buildOrchestrator_(
     std::shared_ptr<AudioPipeline> audio) {
-    auto orch = std::make_shared<Orchestrator>(Orchestrator::Config{});
+    // 之前这里直接 Orchestrator::Config{}，等于 agent.yaml 里eou/barge_in
+    // 那一整段都是死配置（改 yaml 不生效）。现在把用得到的项接上。
+    Orchestrator::Config oc;
+    oc.eou_fast_ms                = impl_->cfg.eou_fast_ms;
+    oc.eou_force_ms            = impl_->cfg.eou_force_ms;
+    oc.max_utterance_ms        = impl_->cfg.max_utterance_ms;
+    oc.barge_in_min_ms         = impl_->cfg.barge_in_min_ms;
+    oc.backchannel_max_ms      = impl_->cfg.backchannel_max_ms;
+    oc.fade_out_ms             = impl_->cfg.fade_out_ms;
+    oc.interrupt_duck_volume   = impl_->cfg.interrupt_duck_volume;
+    oc.barge_in_require_threshold = impl_->cfg.barge_in_require_threshold;
+    oc.capture_sample_rate     = impl_->cfg.audio_sample_rate / 3;  // 48k→16k
+    if (impl_->tts) oc.playback_sample_rate = impl_->tts->config().sample_rate;
+    oc.enable_interrupt_truncation = impl_->cfg.enable_interrupt_truncation;
+    oc.enable_semantic_turn        = impl_->cfg.enable_semantic_turn;
+    oc.eagerness = (impl_->cfg.eagerness == "high")   ? Eagerness::High
+                 : (impl_->cfg.eagerness == "medium") ? Eagerness::Medium
+                                                      : Eagerness::Low;
+    oc.trace_path                  = impl_->cfg.trace_path;
+    oc.enable_metrics              = impl_->cfg.enable_metrics;
+
+    auto orch = std::make_shared<Orchestrator>(oc);
     orch->initialize(std::move(audio), impl_->vad, impl_->asr, impl_->llm, impl_->tts);
     orch->attach_agent(impl_->registry, impl_->router, kSystemPrompt);
     orch->attach_memory(impl_->memory);

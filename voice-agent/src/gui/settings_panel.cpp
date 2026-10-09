@@ -5,6 +5,7 @@
 #include "gui/latency_panel.hpp"
 #include "audio/audio_device.hpp"
 
+#include <QCheckBox>
 #include <QComboBox>
 #include <QGridLayout>
 #include <QGroupBox>
@@ -12,6 +13,7 @@
 #include <QLabel>
 #include <QProgressBar>
 #include <QPushButton>
+#include <QRadioButton>
 #include <QSlider>
 #include <QSpinBox>
 #include <QTimer>
@@ -19,6 +21,8 @@
 
 #include <algorithm>
 #include <functional>
+
+#include <QSignalBlocker>
 
 namespace voice_agent {
 namespace gui {
@@ -87,7 +91,7 @@ void SettingsPanel::buildModelTab_() {
         "选择并下载免费开源小模型，然后“应用切换”到助手。所有文件保存在 models/ 目录下。"),
         page);
     tip->setWordWrap(true);
-    tip->setStyleSheet(QStringLiteral("color:#666;"));
+    tip->setStyleSheet(QStringLiteral("color:#9b9b9b;"));
     pageLayout->addWidget(tip);
 
     auto* grid = new QGridLayout;
@@ -161,13 +165,110 @@ void SettingsPanel::buildBehaviorTab_() {
 
     auto* hint = new QLabel(QStringLiteral(
         "交互设置：\n"
-        "• 按住空格说话（push-to-talk）：按住空格开始监听，松开即停止。\n"
+        "• 语音输入方式：VAD 自动切分，或按住空格/🎙 说话。\n"
+        "• 打断门槛：Agent 说话时你开口，先把它的音量压低，"
+        "说话持续超过门槛才真正停止（过滤咳嗽、咂嘴）。\n"
         "• 喇叭按钮：点击朗读最近一次回复。\n"
         "• 语音端点（VAD/ASR）采用本地模型，不联网，隐私优先。"),
         page);
     hint->setWordWrap(true);
-    hint->setStyleSheet(QStringLiteral("color:#555;"));
+    hint->setStyleSheet(QStringLiteral("color:#9b9b9b;"));
     lay->addWidget(hint);
+
+    // ---- 语音输入方式：VAD 自动切分 / 手动按键 ----
+    auto* inputBox = new QGroupBox(QStringLiteral("语音输入方式"), page);
+    auto* ig = new QGridLayout(inputBox);
+    ig->setContentsMargins(10, 10, 10, 10);
+
+    inputVad_ = new QRadioButton(QStringLiteral(
+        "VAD 自动切分"), inputBox);
+    inputVad_->setToolTip(QStringLiteral(
+        "麦克风常开，检测到你开始说话就自动开始识别，说完静音一小段后"
+        "自动转写并提交。\n"
+        "缺点：一直占着音频设备，环境噪声可能被当成人声；"
+        "思考时容易被自己的键盘声触发。"));
+    inputPtt_ = new QRadioButton(QStringLiteral(
+        "手动按键（按住说话，默认）"), inputBox);
+    inputPtt_->setToolTip(QStringLiteral(
+        "只有按住空格或🎙 才开始录音，松开立刻转写。\n"
+        "不会被环境噪声误触发，也不打断正在进行的思考。"));
+    // 默认选中 PTT（与 agent.yaml 的 input_mode: ptt 一致；
+    // 控制器初始化后会按配置回填，这里只管首帧）
+    inputPtt_->setChecked(true);
+
+    ig->addWidget(inputVad_, 0, 0, 1, 2);
+    ig->addWidget(inputPtt_, 1, 0, 1, 2);
+
+    auto* inputNote = new QLabel(QStringLiteral(
+        "两种方式的区别只在“怎么开始录音”：打断时机与门槛规则两者一致。"
+        "手动按键按下时按键本身就是明确意图，因此立即打断，不等门槛。"),
+        inputBox);
+    inputNote->setWordWrap(true);
+    inputNote->setStyleSheet(QStringLiteral("color:#8a8a8a;"));
+    ig->addWidget(inputNote, 2, 0, 1, 2);
+
+    connect(inputVad_, &QRadioButton::toggled, this, [this](bool on) {
+        if (on) onInputModeSelected_();
+    });
+    connect(inputPtt_, &QRadioButton::toggled, this, [this](bool on) {
+        if (on) onInputModeSelected_();
+    });
+
+    lay->addWidget(inputBox);
+
+    // ---- 打断门槛 ----
+    auto* bargeBox = new QGroupBox(QStringLiteral("打断控制"), page);
+    auto* bg = new QGridLayout(bargeBox);
+    bg->setContentsMargins(10, 10, 10, 10);
+
+    bargeThresholdOn_ = new QCheckBox(
+        QStringLiteral("启用打断门槛（说话持续到阈值才停止 Agent）"), bargeBox);
+    bargeThresholdOn_->setChecked(true);
+    bargeThresholdOn_->setToolTip(QStringLiteral(
+        "关闭后：你在 Agent 说话期间一开口就立即停止它 —— 响应最快，"
+        "但咳嗽、清嗓子也会把回答掐掉。"));
+    bg->addWidget(bargeThresholdOn_, 0, 0, 1, 3);
+
+    bg->addWidget(new QLabel(QStringLiteral("最短语音"), bargeBox), 1, 0);
+    bargeMinSpeechSpin_ = new QSpinBox(bargeBox);
+    bargeMinSpeechSpin_->setRange(0, 2000);
+    bargeMinSpeechSpin_->setValue(160);
+    bargeMinSpeechSpin_->setSingleStep(20);
+    bargeMinSpeechSpin_->setSuffix(QStringLiteral(" ms"));
+    bargeMinSpeechSpin_->setToolTip(QStringLiteral(
+        "开口后必须持续这么久才算插话。低于此时长视为噪声，不打断。\n"
+        "中文偏短（120~200ms），英文可长一些（250~400ms）。"));
+    bg->addWidget(bargeMinSpeechSpin_, 1, 1);
+
+    bg->addWidget(new QLabel(QStringLiteral("确认期音量"), bargeBox), 2, 0);
+    bargeDuckSlider_ = new QSlider(Qt::Horizontal, bargeBox);
+    bargeDuckSlider_->setRange(0, 100);      // 0% ~ 100%
+    bargeDuckSlider_->setValue(35);
+    bargeDuckSlider_->setToolTip(QStringLiteral(
+        "门槛等待期间把 Agent 音量压到多少，避免它盖住你说话。"));
+    bg->addWidget(bargeDuckSlider_, 2, 1);
+    bargeDuckValue_ = new QLabel(QStringLiteral("35%"), bargeBox);
+    bargeDuckValue_->setMinimumWidth(48);
+    bargeDuckValue_->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+    bg->addWidget(bargeDuckValue_, 2, 2);
+
+    connect(bargeDuckSlider_, &QSlider::valueChanged, this, [this](int v) {
+        if (bargeDuckValue_)
+            bargeDuckValue_->setText(QStringLiteral("%1%").arg(v));
+    });
+
+    auto* bargeApply = new QPushButton(QStringLiteral("应用打断设置"), bargeBox);
+    bargeApply->setStyleSheet(QStringLiteral(
+        "background:#1a73e8;color:#fff;padding:6px 16px;border-radius:4px;"));
+    bg->addWidget(bargeApply, 3, 0, 1, 3);
+    connect(bargeApply, &QPushButton::clicked, this, [this] {
+        emit bargeInSettingsApplied(
+            bargeThresholdOn_->isChecked(),
+            bargeMinSpeechSpin_->value(),
+            bargeDuckSlider_->value());
+    });
+
+    lay->addWidget(bargeBox);
 
     // ---- TTS 语音参数：语速 / 发音人 ----
     auto* ttsBox = new QGroupBox(QStringLiteral("语音播报（TTS）"), page);
@@ -199,7 +300,7 @@ void SettingsPanel::buildBehaviorTab_() {
         "• 发音人：仅 Kokoro 模型生效，SAPI 使用系统默认中文语音"),
         ttsBox);
     note->setWordWrap(true);
-    note->setStyleSheet(QStringLiteral("color:#888;"));
+    note->setStyleSheet(QStringLiteral("color:#8a8a8a;"));
     tg->addWidget(note, 2, 0, 1, 3);
 
     auto* ttsApply = new QPushButton(QStringLiteral("应用语音参数"), ttsBox);
@@ -233,7 +334,7 @@ void SettingsPanel::buildAudioTab_() {
         "说话时电平仍低于 -40 dB，说明声音没有进入本机（设备选错或系统录音权限未开）。"),
         page);
     tip->setWordWrap(true);
-    tip->setStyleSheet(QStringLiteral("color:#666;"));
+    tip->setStyleSheet(QStringLiteral("color:#9b9b9b;"));
     lay->addWidget(tip);
 
     auto* devRow = new QHBoxLayout;
@@ -251,7 +352,7 @@ void SettingsPanel::buildAudioTab_() {
 
     micStatus_ = new QLabel(page);
     micStatus_->setWordWrap(true);
-    micStatus_->setStyleSheet(QStringLiteral("color:#555;"));
+    micStatus_->setStyleSheet(QStringLiteral("color:#9b9b9b;"));
     lay->addWidget(micStatus_);
 
     auto* levelRow = new QHBoxLayout;
@@ -274,7 +375,8 @@ void SettingsPanel::buildAudioTab_() {
         emit audioDeviceApplied(micCombo_->currentData().toString());
     });
 
-    refreshAudioDevices_();
+    // 设备枚举是磁盘/系统 IO：延后到首帧绘制之后，不阻塞界面加载
+    QTimer::singleShot(0, this, [this] { refreshAudioDevices_(); });
     innerTabs_->addTab(page, QStringLiteral("麦克风调试"));
 }
 
@@ -305,11 +407,27 @@ void SettingsPanel::setInputLevel(float db) {
     const float clamped = std::max(-60.0f, std::min(0.0f, db));
     levelBar_->setValue(static_cast<int>(clamped + 60.0f));
     levelLabel_->setText(QStringLiteral("%1 dB").arg(db, 0, 'f', 1));
-    const QString color = db < -40.0f ? QStringLiteral("#999")
+    const QString color = db < -40.0f ? QStringLiteral("#6f6f6f")
                         : db < -20.0f ? QStringLiteral("#e0a020")
-                                      : QStringLiteral("#188038");
+                                      : QStringLiteral("#6dd58c");
     levelBar_->setStyleSheet(
         QStringLiteral("QProgressBar::chunk{background:%1;}").arg(color));
+}
+
+void SettingsPanel::onInputModeSelected_() {
+    if (!inputVad_ || !inputPtt_) return;
+    // 两个 radio 互斥，被选中那个就是目标状态
+    emit inputModeApplied(inputVad_->isChecked());
+}
+
+void SettingsPanel::setInputMode(bool vadEnabled) {
+    if (!inputVad_ || !inputPtt_) return;
+    // 用 QSignalBlocker 防止回填时又触发 inputModeApplied，
+    // 否则会和外部状态互相打乒乓。
+    const QSignalBlocker b1(inputVad_);
+    const QSignalBlocker b2(inputPtt_);
+    inputVad_->setChecked(vadEnabled);
+    inputPtt_->setChecked(!vadEnabled);
 }
 
 SettingsPanel::~SettingsPanel() = default;

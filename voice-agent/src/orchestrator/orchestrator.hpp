@@ -57,6 +57,11 @@ struct OrchestratorConfig {
     int barge_in_min_ms = 160;
     int backchannel_max_ms = 600;
     int fade_out_ms = 40;
+    // 打断确认期间的 Agent 音量比例（0~1）。用户开口但尚未达到门槛时，
+    // 把 Agent 压低到该比例，避免双方同音量互相盖住。
+    float interrupt_duck_volume = 0.35f;
+    // 是否启用打断门槛。false = 退回"开口即打断"（ cough 也会掐掉回答）。
+    bool barge_in_require_threshold = true;
     int capture_sample_rate = 16000;  // ASR 采样率
     int playback_sample_rate = 24000;  // TTS 采样率
 
@@ -150,6 +155,13 @@ public:
     // 打断检测事件
     void on_barge_in_detected();
 
+    // 打断门槛：Agent 播报时用户开口 → duck 音量并开始计时；
+    // 语音持续到 barge_in_min_ms 才真正 interrupt_agent_()。
+    // 返回 true 表示门槛已满足、应当立即打断。
+    bool poll_barge_in_threshold_();
+    // 放弃正在等待的打断（用户只是短促出声、随即停止 → 不打断，音量复原）
+    void cancel_barge_in_pending_();
+
     // ========== 回调 ==========
 
     // 设置文本输出回调（轮次结束时的完整回答，调用一次）
@@ -181,6 +193,13 @@ public:
     // 关闭：跳过 VAD，由 begin_capture/end_capture 手动分段（ASR 直接接管）。
     void set_vad_enabled(bool enabled) { vad_enabled_.store(enabled); }
     bool vad_enabled() const { return vad_enabled_.load(); }
+
+    // 打断门槛（运行时可调，供设置面板用）。
+    // barge_in_min_ms <= 0 等价于 require_threshold=false（开口即打断）。
+    void set_barge_in_threshold(bool enabled, int min_ms, float duck_volume);
+    bool barge_in_threshold() const { return barge_in_require_threshold; }
+    int barge_in_threshold_ms() const { return config_.barge_in_min_ms; }
+    float barge_in_duck_volume() const { return interrupt_duck_volume; }
 
     // 手动开始采集（VAD 关闭时由上层在按下对讲时调用）
     void begin_capture();
@@ -403,6 +422,23 @@ private:
     // VAD 开关（默认开启）。关闭后跳过 vad_->process，改用手动分段。
     std::atomic<bool> vad_enabled_{true};
     uint64_t capture_start_us_{0};       // 手动采集开始时刻（微秒）
+
+    // ========== 打断确认门槛（barge_in_min_ms 真正生效的地方）==========
+    // Agent 播报时用户开口，**不立即停声**：先把Agent 音量 duck 到
+    // interrupt_duck_volume，等语音持续 barge_in_min_ms 才真正打断。
+    //
+    // 为什么要有门槛：原来on_vad_speech_start 里是"开口即打断"，
+    // 咳嗽、咂嘴、"嗯"这种短促音都会把回答掐掉；而 barge_in_min_ms
+    // 这个配置项虽然存在于 agent.yaml，对打断路径却完全没有作用
+    // （SmartTurn::evaluate_barge_in 全仓库零调用点，是死代码）。
+    //
+    // 手动 PTT（VAD 关闭）不走这里：按键本身就是明确意图，key-down 即打断。
+    std::atomic<bool> barge_in_pending_{false};   // 已开口，正在等门槛
+    double barge_in_pending_start_ms_{0.0};       // 开口时刻
+    // duck 期间的用户语音是否已足够长到可以确认打断（门槛判定结果）
+    std::atomic<bool> barge_in_confirmed_{false};
+    float interrupt_duck_volume = 0.35f;     // 确认期间 Agent 音量比例
+    bool barge_in_require_threshold = true; // 关闭 = 退回"开口即打断"
 
     // Agent 工具（M5，可选）
     std::shared_ptr<ToolRegistry> agent_tools_;

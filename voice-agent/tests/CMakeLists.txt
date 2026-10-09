@@ -156,6 +156,35 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/test_remote_llm.cpp)
     voice_agent_test_copy_rt(test_remote_llm)
 endif()
 
+# §24 TTS 适配器：Qwen3-TTS / Chatterbox 的韵律→引擎控制映射（纯逻辑，不依赖模型）
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/test_tts_adapters.cpp)
+    add_executable(test_tts_adapters test_tts_adapters.cpp)
+    target_link_libraries(test_tts_adapters PRIVATE voice_agent_core)
+    add_test(NAME test_tts_adapters COMMAND test_tts_adapters)
+    voice_agent_test_env(test_tts_adapters)
+    voice_agent_test_copy_rt(test_tts_adapters)
+endif()
+
+# §24 补完：TTS bridge 客户端（WAV 解析 / JSON 协议 / health 降级判定 / controls 贯通）
+# 全部离线：不起网络、不起 Python 进程、不加载模型。
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/test_tts_bridge.cpp)
+    add_executable(test_tts_bridge test_tts_bridge.cpp)
+    target_link_libraries(test_tts_bridge PRIVATE voice_agent_core)
+    add_test(NAME test_tts_bridge COMMAND test_tts_bridge)
+    voice_agent_test_env(test_tts_bridge)
+    voice_agent_test_copy_rt(test_tts_bridge)
+endif()
+
+# ZipVoice 引擎端到端（真实模型）。模型缺失时 SKIP 而非 FAIL——
+# 换机/CI 跑不过这关是正常的，但静默通过会掩盖问题，所以会打印 SKIP 原因。
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/test_zipvoice_engine.cpp)
+    add_executable(test_zipvoice_engine test_zipvoice_engine.cpp)
+    target_link_libraries(test_zipvoice_engine PRIVATE voice_agent_core)
+    add_test(NAME test_zipvoice_engine COMMAND test_zipvoice_engine)
+    voice_agent_test_env(test_zipvoice_engine)
+    voice_agent_test_copy_rt(test_zipvoice_engine)
+endif()
+
 # 临时 probe：隔离 validate_tool_args_json
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/test_probe.cpp)
     add_executable(test_probe test_probe.cpp)
@@ -234,4 +263,13 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/test_kokoro.cpp AND SHERPA_C_API_LIB)
             "${SHERPA_ROOT}/lib/onnxruntime.dll"
             "$<TARGET_FILE_DIR:test_kokoro>"
         COMMENT "Copying onnxruntime.dll next to test")
+endif()
+
+# 打断控制测试（AudioRouter 淡出/duck/播放进度 + barge_in 配置解析）
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/test_barge_in_control.cpp)
+    add_executable(test_barge_in_control test_barge_in_control.cpp)
+    target_link_libraries(test_barge_in_control PRIVATE voice_agent_core)
+    add_test(NAME test_barge_in_control COMMAND test_barge_in_control)
+    voice_agent_test_env(test_barge_in_control)
+    voice_agent_test_copy_rt(test_barge_in_control)
 endif()

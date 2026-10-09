@@ -65,8 +65,17 @@ public:
     // 对后续合成即时生效，并持久化到 agent.yaml。async 在线程内处理。
     void setTtsParams(double speed, double pitch, int speakerId);
 
+    // 打断门槛：enabled=false 退回"开口即打断"；minSpeechMs 为最短有效语音
+    // 门槛（毫秒）；duckPercent 为门槛等待期间 Agent 的音量百分比。
+    // 即时生效（Orchestrator 侧有 setter），并持久化到 agent.yaml。
+    void setBargeInSettings(bool enabled, int minSpeechMs, int duckPercent);
+
     // 当前 VAD 开关状态
     bool vadEnabled() const { return vad_enabled_.load(); }
+
+    // 当前语音播报开关状态（仅影响新回答是否自动发声）。
+    // 实现放在 .cpp：Impl 在本头文件里是不完整类型。
+    bool ttsEnabled() const;
 
     // 切换麦克风输入设备（空串 = 系统默认设备），异步在 worker 线程重建音频管道
     void setAudioDevice(const QString& deviceName);
@@ -102,17 +111,18 @@ signals:
     void memoryList(const QVariantList& items);         // 记忆库最近条目（供"共享记忆"侧栏）
     void ttsEnabledChanged(bool enabled);       // TTS 开关状态变化
     void vadEnabledChanged(bool enabled);       // VAD 开关状态变化
+    void bargeInSettingsChanged(bool enabled, int minSpeechMs, int duckPercent);
 
 private:
-    enum class TaskType { StartVoice, StopVoice, SendText, SetModels, PlayResponse, RefreshLat, SetTts, SetTtsParams, SetVad, SetAudioDevice, ListMemory, Quit };
+    enum class TaskType { StartVoice, StopVoice, SendText, SetModels, PlayResponse, RefreshLat, SetTts, SetTtsParams, SetVad, SetAudioDevice, SetBargeIn, ListMemory, Quit };
     struct Task {
         TaskType type{TaskType::Quit};
         QString text;
         ModelPaths models;
         bool flag{true};
-        double d0{1.0};   // 语速倍率（SetTtsParams）
+        double d0{1.0};   // 语速倍率（SetTtsParams）/ duck 比例（SetBargeIn）
         double d1{1.0};   // 音调倍率（保留）
-        int ival{45};     // 发音人 ID（SetTtsParams）
+        int ival{45};     // 发音人ID（SetTtsParams）/ 最短语音 ms（SetBargeIn）
     };
 
     void threadMain_();
@@ -141,6 +151,7 @@ private:
     void handleSetTts_(bool enabled);
     void handleSetTtsParams_(double speed, double pitch, int speakerId);
     void handleSetVad_(bool enabled);
+    void handleSetBargeIn_(bool enabled, int minSpeechMs, double duckRatio);
     void handleListMemory_();
     void emitText_(const std::string& text);   // llmComplete + 记录最近回答
     void persistConfig_();
@@ -168,7 +179,9 @@ private:
     std::thread worker_;
     std::atomic<bool> running_{false};
     std::atomic<bool> listening_{false};
-    std::atomic<bool> vad_enabled_{true};   // VAD 端点检测开关（默认开启）
+    // VAD 开关：默认 false = 手动按键（PTT）。启动时会被 agent.yaml 的
+    // input_mode 覆盖（initCore_ 里 vad_enabled_.store(cfg.input_mode != "ptt")）。
+    std::atomic<bool> vad_enabled_{false};
     std::mutex mtx_;
     std::condition_variable cv_;
     std::deque<Task> queue_;
