@@ -103,22 +103,18 @@ bool open_request(RequestHandle& req, HINTERNET connect, const Url& u,
     return true;
 }
 
-std::wstring header_name_to_wstr(const std::string& s) {
-    std::wstring w;
-    w.reserve(s.size());
-    for (char c : s) {
-        // WinHTTP 要求 HTTP 头名以 \r\n 结束
-        w.push_back(static_cast<unsigned char>(c));
-        w.push_back(L'\r');
-        w.push_back(L'\n');
-    }
-    return w;
-}
-
-std::wstring header_value_to_wstr(const std::string& s) {
-    std::wstring w = utf8_to_wstr(s);
-    w.push_back(L'\r');
-    w.push_back(L'\n');
+// 组装一条 HTTP 头："Name: Value\r\n"
+//
+// 曾经的实现给头名的**每个字符**后面插 \r\n，产出 "C\r\no\r\nn\r\n..."
+// 这种畸形头，WinHttpSendRequest 直接返回 FALSE（ERROR_INVALID_PARAMETER，
+// 报成 "send: 参数错误"）。remote_llm 一直没做真实联网验证，所以这个bug
+// 一直没暴露 —— 直到 bridge 要真的 POST 才被撞出来。
+// 症状有迷惑性：GET 能通（同一条路径），POST 必失败，容易误判成"服务端拒绝"。
+std::wstring make_header_line(const std::string& name, const std::string& value) {
+    std::wstring w = utf8_to_wstr(name);
+    w += L": ";
+    w += utf8_to_wstr(value);
+    w += L"\r\n";
     return w;
 }
 
@@ -126,14 +122,13 @@ bool send_headers(RequestHandle& req, const std::map<std::string, std::string>& 
                   const std::string& body, bool has_body, std::string& err) {
     std::wstring hdr;
     for (const auto& [k, v] : headers) {
-        hdr += header_name_to_wstr(k);
-        hdr += header_value_to_wstr(v);
+        hdr += make_header_line(k, v);
     }
-    hdr.push_back(L'\0');   // 双 NUL 终止
-    hdr.pop_back();
-
+    // WinHttpSendRequest 的 dwHeadersLength 不含结尾的 NUL，
+    // 所以长度就是 wstring 实际字符数（hdr.size()，非 -1）。
     const BOOL ok = ::WinHttpSendRequest(
-        req.h, hdr.c_str(), static_cast<DWORD>(hdr.size()),
+        req.h, hdr.empty() ? WINHTTP_NO_ADDITIONAL_HEADERS : hdr.c_str(),
+        static_cast<DWORD>(hdr.size()),
         has_body ? const_cast<char*>(body.data()) : WINHTTP_NO_REQUEST_DATA,
         has_body ? static_cast<DWORD>(body.size()) : 0,
         static_cast<DWORD>(body.size()), 0);

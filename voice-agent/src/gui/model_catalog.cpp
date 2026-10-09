@@ -178,6 +178,115 @@ const std::vector<ModelEntry>& downloadableModels() {
             67255926,   // ≈64 MB
             QStringLiteral("64 MB"),
         },
+        // ===== §24：PyTorch TTS（推理走 scripts/tts_bridge_server.py）=====
+        // 与上面所有 ONNX/GGUF 条目的根本区别：**权重不是给 C++ 直接加载的**，
+        // 而是给独立Python 进程用的。下载完仍需：
+        //     pip install qwen-tts   （或 pip install chatterbox-tts）
+        //     python scripts/tts_bridge_server.py --engine qwen3tts --port 8770
+        // 未启动 bridge 时 C++ 侧自动回退到系统语音(SAPI)，不会静默失败。
+        // URL 与大小均已实测（HTTP 200 + content-length）。
+        {
+            ModelCategory::Tts,
+            QStringLiteral("qwen3-tts-0.6b-customvoice"),
+            QStringLiteral("Qwen3-TTS 12Hz 0.6B (CustomVoice)"),
+            QStringLiteral("自然语言 instruction 控制风格；需 Python 推理环境，bridge 未启动时自动回退系统语音"),
+            // 主文件取最大的权重（下载器按extraFiles 顺序下载）
+            QUrl(QStringLiteral(
+                "https://huggingface.co/Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice/resolve/main/model.safetensors")),
+            QStringLiteral("tts/qwen3tts/model.safetensors"),
+            {
+                // speech_tokenizer 子目录：Qwen3-TTS 的 12Hz 语音 tokenizer 必须与
+                // 主模型版本严格配套，混版本会直接生成噪声而不是报错。
+                {QUrl(QStringLiteral(
+                     "https://huggingface.co/Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice/resolve/main/speech_tokenizer/model.safetensors")),
+                 QStringLiteral("tts/qwen3tts/speech_tokenizer/model.safetensors")},
+                {QUrl(QStringLiteral(
+                     "https://huggingface.co/Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice/resolve/main/speech_tokenizer/config.json")),
+                 QStringLiteral("tts/qwen3tts/speech_tokenizer/config.json")},
+                {QUrl(QStringLiteral(
+                     "https://huggingface.co/Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice/resolve/main/speech_tokenizer/configuration.json")),
+                 QStringLiteral("tts/qwen3tts/speech_tokenizer/configuration.json")},
+                {QUrl(QStringLiteral(
+                     "https://huggingface.co/Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice/resolve/main/speech_tokenizer/preprocessor_config.json")),
+                 QStringLiteral("tts/qwen3tts/speech_tokenizer/preprocessor_config.json")},
+                {QUrl(QStringLiteral(
+                     "https://huggingface.co/Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice/resolve/main/config.json")),
+                 QStringLiteral("tts/qwen3tts/config.json")},
+                {QUrl(QStringLiteral(
+                     "https://huggingface.co/Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice/resolve/main/generation_config.json")),
+                 QStringLiteral("tts/qwen3tts/generation_config.json")},
+                {QUrl(QStringLiteral(
+                     "https://huggingface.co/Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice/resolve/main/preprocessor_config.json")),
+                 QStringLiteral("tts/qwen3tts/preprocessor_config.json")},
+                {QUrl(QStringLiteral(
+                     "https://huggingface.co/Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice/resolve/main/tokenizer_config.json")),
+                 QStringLiteral("tts/qwen3tts/tokenizer_config.json")},
+                {QUrl(QStringLiteral(
+                     "https://huggingface.co/Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice/resolve/main/vocab.json")),
+                 QStringLiteral("tts/qwen3tts/vocab.json")},
+                {QUrl(QStringLiteral(
+                     "https://huggingface.co/Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice/resolve/main/merges.txt")),
+                 QStringLiteral("tts/qwen3tts/merges.txt")},
+            },
+            false,
+            // 实测 content-length 累加：
+            //   1811626576 + 682293092 + 2336 + 76 + 234 + 4908 + 245
+            //   + 127 + 7344 + 2776833 + 1671839
+            2497794610,
+            QStringLiteral("2.33 GB"),
+        },
+        {
+            ModelCategory::Tts,
+            QStringLiteral("chatterbox"),
+            QStringLiteral("Chatterbox (0.5B, MIT)"),
+            QStringLiteral("exaggeration/cfg_weight 控制情绪强度；需 Python 推理环境，bridge 未启动时自动回退系统语音"),
+            QUrl(QStringLiteral(
+                "https://huggingface.co/ResembleAI/chatterbox/resolve/main/t3_cfg.pt")),
+            QStringLiteral("tts/chatterbox/t3_cfg.pt"),
+            {
+                {QUrl(QStringLiteral(
+                     "https://huggingface.co/ResembleAI/chatterbox/resolve/main/s3gen.pt")),
+                 QStringLiteral("tts/chatterbox/s3gen.pt")},
+                {QUrl(QStringLiteral(
+                     "https://huggingface.co/ResembleAI/chatterbox/resolve/main/ve.pt")),
+                 QStringLiteral("tts/chatterbox/ve.pt")},
+                {QUrl(QStringLiteral(
+                     "https://huggingface.co/ResembleAI/chatterbox/resolve/main/conds.pt")),
+                 QStringLiteral("tts/chatterbox/conds.pt")},
+                {QUrl(QStringLiteral(
+                     "https://huggingface.co/ResembleAI/chatterbox/resolve/main/tokenizer.json")),
+                 QStringLiteral("tts/chatterbox/tokenizer.json")},
+            },
+            false,
+            // 实测 content-length 累加：
+            //   1064892246 + 1057165844 + 5698626 + 107374 + 25470
+            2127889560,
+            QStringLiteral("1.98 GB"),
+        },
+        // ===== ZipVoice：零样本音色克隆，纯 CPU INT8 实时 =====
+        // 与上面所有条目最大的不同：**单文件 tar.bz2**（解压后自带
+        // encoder/decoder/tokens/lexicon/espeak-ng-data + 3 个参考音频），
+        // 外加一个**独立声码器** vocos_24khz.onnx（所有音色共用）。
+        // 实测：RTF 0.26~0.61（2 线程 CPU，比实时快），24kHz 输出，
+        // 总计约 156 MB —— 之前 Qwen3-TTS 需要 2.33GB 且装不进 2GB 显存。
+        // 注意：声码器不是可选项，缺了它连引擎都建不起来。
+        {
+            ModelCategory::Tts,
+            QStringLiteral("zipvoice-zh-en"),
+            QStringLiteral("ZipVoice INT8 (零样本克隆，中英)"),
+            QStringLiteral("3 秒参考音频即可克隆音色，纯 CPU 实时；需另下vocos_24khz 声码器"),
+            QUrl(QStringLiteral(
+                "https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/sherpa-onnx-zipvoice-distill-int8-zh-en-emilia.tar.bz2")),
+            QStringLiteral("tts/zipvoice/sherpa-onnx-zipvoice-distill-int8-zh-en-emilia.tar.bz2"),
+            {
+                {QUrl(QStringLiteral(
+                     "https://github.com/k2-fsa/sherpa-onnx/releases/download/vocoder-models/vocos_24khz.onnx")),
+                 QStringLiteral("tts/vocos_24khz.onnx")},
+            },
+            true,        // 主文件是 tar.bz2，解压到 tts/ 后删除压缩包
+            109162785 + 54157409,  // 实测 content-length：104MB + 52MB ≈ 156 MB
+            QStringLiteral("156 MB"),
+        },
     };
     return kModels;
 }
@@ -189,7 +298,11 @@ bool isModelFile(const QString& fileName) {
     return lower.endsWith(QStringLiteral(".gguf")) ||
            lower.endsWith(QStringLiteral(".onnx")) ||
            lower.endsWith(QStringLiteral(".bin")) ||
-           lower.endsWith(QStringLiteral(".ggml"));
+           lower.endsWith(QStringLiteral(".ggml")) ||
+           // §24：PyTorch TTS 权重。不加这两行的话，下载完的 Qwen3-TTS /
+           // Chatterbox 在本地扫描里完全不可见——用户会以为没下成功。
+           lower.endsWith(QStringLiteral(".safetensors")) ||
+           lower.endsWith(QStringLiteral(".pt"));
 }
 
 // 目录递归占用总字节数

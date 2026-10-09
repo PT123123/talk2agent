@@ -3,6 +3,7 @@
 #include "util/log.hpp"
 #include "gui/main_window.hpp"
 #include <QApplication>
+#include <QPalette>
 
 #include <climits>
 #include <crtdbg.h>
@@ -50,7 +51,30 @@ static void dump_stack_to_file(EXCEPTION_POINTERS* ep) {
     }
 
     void* calls[128] = {};
-    USHORT n = CaptureStackBackTrace(0, 128, calls, nullptr);
+    USHORT n = 0;
+
+    // 优先用异常现场的 ContextRecord 做 StackWalk64 回溯——
+    // CaptureStackBackTrace 从过滤器的栈帧往上抓，拿不到崩溃点的真实调用链。
+    CONTEXT walkCtx{};
+    if (ep && ep->ContextRecord) {
+        walkCtx = *ep->ContextRecord;
+        STACKFRAME64 frame{};
+        frame.AddrPC.Offset = walkCtx.Rip;   frame.AddrPC.Mode = AddrModeFlat;
+        frame.AddrFrame.Offset = walkCtx.Rbp; frame.AddrFrame.Mode = AddrModeFlat;
+        frame.AddrStack.Offset = walkCtx.Rsp; frame.AddrStack.Mode = AddrModeFlat;
+        auto pStackWalk = (decltype(StackWalk64)*)GetProcAddress(hDbg, "StackWalk64");
+        if (pStackWalk) {
+            for (int i = 0; i < 128; ++i) {
+                if (!pStackWalk(IMAGE_FILE_MACHINE_AMD64, hProc, hProc, &frame,
+                                &walkCtx, nullptr, nullptr, nullptr, nullptr))
+                    break;
+                if (frame.AddrPC.Offset == 0) break;
+                if (n < 128) calls[n++] = reinterpret_cast<void*>(frame.AddrPC.Offset);
+            }
+        }
+    }
+    if (n == 0)   // 兜底：无上下文时退回启发式抓取
+        n = CaptureStackBackTrace(0, 128, calls, nullptr);
     for (USHORT i = 0; i < n; ++i) {
         std::uintptr_t pc = reinterpret_cast<std::uintptr_t>(calls[i]);
         SYMBOL_INFO sym{};
@@ -113,6 +137,33 @@ int main(int argc, char* argv[]) {
     QApplication app(argc, argv);
     QApplication::setOrganizationName("PT123123");
     QApplication::setApplicationName("VoiceAgent");
+
+    // ===== 暗黑主题基础：Fusion 风格 + 深色调色板 =====
+    // Windows 原生 style 会忽略大部分 QPalette 角色；切到 Fusion 才能让
+    // 设置页/下拉框/菜单等跟随深色。主界面细节色再由 main_window 的 QSS 覆盖。
+    app.setStyle("Fusion");
+    {
+        QPalette p;
+        const QColor text(0xec, 0xec, 0xec);
+        p.setColor(QPalette::Window, QColor(0x21, 0x21, 0x21));
+        p.setColor(QPalette::WindowText, text);
+        p.setColor(QPalette::Base, QColor(0x1e, 0x1e, 0x1e));
+        p.setColor(QPalette::AlternateBase, QColor(0x2a, 0x2a, 0x2a));
+        p.setColor(QPalette::ToolTipBase, QColor(0x2a, 0x2a, 0x2a));
+        p.setColor(QPalette::ToolTipText, text);
+        p.setColor(QPalette::Text, text);
+        p.setColor(QPalette::PlaceholderText, QColor(0x8d, 0x8d, 0x8d));
+        p.setColor(QPalette::Button, QColor(0x2f, 0x2f, 0x2f));
+        p.setColor(QPalette::ButtonText, text);
+        p.setColor(QPalette::BrightText, Qt::white);
+        p.setColor(QPalette::Highlight, QColor(0x2f, 0x4a, 0x73));
+        p.setColor(QPalette::HighlightedText, text);
+        p.setColor(QPalette::Link, QColor(0x7a, 0xaa, 0xfc));
+        p.setColor(QPalette::Disabled, QPalette::Text, QColor(0x6f, 0x6f, 0x6f));
+        p.setColor(QPalette::Disabled, QPalette::WindowText, QColor(0x6f, 0x6f, 0x6f));
+        p.setColor(QPalette::Disabled, QPalette::ButtonText, QColor(0x6f, 0x6f, 0x6f));
+        app.setPalette(p);
+    }
 
     voice_agent::gui::MainWindow window;
     window.show();

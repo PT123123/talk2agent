@@ -43,7 +43,7 @@ LatencyPanel::LatencyPanel(QWidget* parent) : QWidget(parent) {
         "底部“反馈建议”：按每轮完整阶段耗时判定瓶颈，并给出对应模型的调整建议（仅记录+建议，不自动改动参数）。"),
         this);
     note_->setWordWrap(true);
-    note_->setStyleSheet(QStringLiteral("color:#666;"));
+    note_->setStyleSheet(QStringLiteral("color:#9b9b9b;"));
     root->addWidget(note_);
 
     table_ = new QTableWidget(this);
@@ -72,7 +72,7 @@ LatencyPanel::LatencyPanel(QWidget* parent) : QWidget(parent) {
     // ===== 反馈建议历史区 =====
     auto* fbHead = new QLabel(
         QStringLiteral("反馈建议（每轮一次 · 瓶颈=占比≥30%且≥1500ms · 仅建议不自动应用）"), this);
-    fbHead->setStyleSheet(QStringLiteral("font-weight:600; color:#333; margin-top:8px;"));
+    fbHead->setStyleSheet(QStringLiteral("font-weight:600; color:#ececec; margin-top:8px;"));
     root->addWidget(fbHead);
 
     feedback_ = new QTextBrowser(this);
@@ -80,7 +80,7 @@ LatencyPanel::LatencyPanel(QWidget* parent) : QWidget(parent) {
     feedback_->setOpenExternalLinks(false);
     feedback_->setStyleSheet(
         QStringLiteral("QTextBrowser{font-family:'Consolas','Cascadia Mono',monospace;"
-                       "font-size:12px; background:#fafafa; border:1px solid #d0d0d0;}"));
+                       "font-size:12px; background:#1c1c1c; border:1px solid #2c2c2c; color:#d4d4d4;}"));
     root->addWidget(feedback_, 2);
 
     // 定时采集
@@ -186,21 +186,21 @@ void LatencyPanel::appendFeedback_(const QVariantMap& timeline) {
     // ===== 生成 HTML 块并追加 =====
     ++feedbackIndex_;
     QString block;
-    block += QStringLiteral("<div style='background:#fff;border:1px solid #e0e0e0;"
+    block += QStringLiteral("<div style='background:#262626;border:1px solid #3a3a3a;"
                             "border-radius:6px;padding:6px 8px;margin-bottom:6px;'>");
     block += QStringLiteral("<b>#%1 [%2]</b> 合计 %3 · 瓶颈判定: <b>%4</b>"
-                            "<br/><span style='color:#666;'>")
+                            "<br/><span style='color:#9b9b9b;'>")
                  .arg(feedbackIndex_)
                  .arg(mode)
                  .arg(fmt(total))
                  .arg(!bottleneck.isEmpty()
-                          ? QStringLiteral("<font color='#c0392b'>存在瓶颈：%1</font>").arg(bottleneck)
-                          : QStringLiteral("<font color='#27ae60'>无瓶颈</font>"));
+                          ? QStringLiteral("<font color='#f28b82'>存在瓶颈：%1</font>").arg(bottleneck)
+                          : QStringLiteral("<font color='#6dd58c'>无瓶颈</font>"));
     if (!nonBottleneck.isEmpty()) {
         block += QStringLiteral("　可并行/非瓶颈：%1").arg(nonBottleneck.join(QLatin1String("、")));
     }
     block += QStringLiteral("</span><br/>") + suggestLines.join(QLatin1Char('\n')) +
-             QStringLiteral("<br/><span style='color:#a0a0a0;'>仅记录+建议，未自动改动参数。</span>");
+             QStringLiteral("<br/><span style='color:#7a7a7a;'>仅记录+建议，未自动改动参数。</span>");
     block += QStringLiteral("</div>");
 
     feedback_->append(block);

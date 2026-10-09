@@ -1,0 +1,7 @@
+# probe_zipvoice 的测试用例（UTF-8）
+# 单独放文件是因为 Windows PowerShell 5.1 传中文命令行参数会按 GBK 编码，
+# sherpa-onnx 收到乱码后报 "Failed to convert '' to token IDs"（reference_text 变空串）。
+# 用文件传参绕开这个坑 —— 真实代码里文本来自 LLM 输出，不走命令行，不受影响。
+<ref>news-female.wav</ref>
+<reftxt>各位村民, 大家新年好! 近期, 湖北省武汉市等多个地区</reftxt>
+<text>voice-agent接入测试。这是一段中文语音合成样例, 用来确认零样本克隆链路是否通畅, 以及多句话的切分是否正确。</text>

@@ -241,6 +241,9 @@ set(CORE_SOURCES
     src/tts/prosody.cpp
     src/tts/response_plan.cpp
     src/tts/tts_adapter.cpp
+    src/tts/qwen3_tts_adapter.cpp
+    src/tts/chatterbox_adapter.cpp
+    src/tts/tts_bridge.cpp
     src/llm/llm.cpp
     src/agent/grammar.cpp
     src/agent/tool_registry.cpp

@@ -60,6 +60,8 @@ std::vector<DeviceInfo> AudioDeviceManager::list_input_devices() const {
         LOG_WARN("Failed to get input devices");
         return devices;
     }
+    LOG_INFO("get_devices done: capture={} playback={}", static_cast<int>(capture_count),
+             static_cast<int>(playback_count));
 
     for (ma_uint32 i = 0; i < capture_count; i++) {
         DeviceInfo info;

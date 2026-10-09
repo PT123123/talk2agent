@@ -18,9 +18,9 @@ configure:
 build: configure
     cmd /c 'call "{{vcvars}}" && cmake --build {{bd}} -j'
 
-# 构建并运行 GUI（自动编译 + 配置 Qt DLL 路径）
-run: configure
-    cmd /c 'call "{{vcvars}}" && cmake --build {{bd}} --target voice-agent -j'
+# 仅运行已构建的 GUI（不编译；需先 just build，exe 不存在会报错）
+run:
+    if (-not (Test-Path ".\{{bd}}\voice-agent.exe")) { Write-Error "voice-agent.exe 不存在，请先执行 just build"; exit 1 }
     $env:PATH = "{{qt}}\bin;$env:PATH"
     Start-Process ".\{{bd}}\voice-agent.exe"
 
