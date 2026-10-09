@@ -10,6 +10,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <cstdint>
 
 #include "gui/model_catalog.hpp"
 #include "audio/audio_pipeline.hpp"
@@ -172,6 +173,13 @@ private:
     void seedModelInfo_();
     void markModelLoading_(const std::string& key, const std::string& path);
     void markModelReady_(const std::string& key, double load_ms);
+    // 显式标"未加载"（如 PTT 模式下刻意不加载 VAD），与"idle 初始态"区分
+    void markModelIdle_(const std::string& key, const std::string& path);
+    // 记录某模型加载带来的进程私有内存增量（字节）
+    void setModelRam_(const std::string& key, std::uint64_t bytes);
+    // 按需加载 VAD 模型（幂等）。PTT 模式下 VAD 模型不常驻内存，
+    // 用户切到 VAD 自动切分时才真正加载会话。
+    void ensureVadModel_(const char* reason);
     void emitModelStatus_();
 
     void emitState_(int state_int);

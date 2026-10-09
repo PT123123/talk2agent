@@ -5,6 +5,7 @@
 #include "core/event_bus.hpp"
 #include "util/config.hpp"
 #include "util/log.hpp"
+#include "util/mem_probe.hpp"
 #include "orchestrator/orchestrator.hpp"
 #include "agent/tool_registry.hpp"
 #include "agent/agent_loop.hpp"
@@ -228,6 +229,20 @@ TTSConfig tts_config_for_dir(const std::string& dir, const AppConfig& cfg) {
     return tc;
 }
 
+// 采样一次私有内存，返回"相对 before 增加了多少"。
+//
+// 用来给每个模型估运行时占用：加载前后各采一次，差值就是这个模型
+// 真正推进来的内存（权重 + KV cache + 算子 workspace）。
+//
+// 为什么不用模型文件大小：文件是磁盘占用，权重解压/量化后的实际
+// 内存和它不是一个量级（GGUF 尤其明显）；而且 GPU 后端下大头根本
+// 不在本进程显存里，这个数至少不会离谱。
+// 差值可能为负（加载过程里别的组件正好释放了），此时报 0 而不是负数。
+std::uint64_t ram_delta_since(std::uint64_t before) {
+    const std::uint64_t after = mem_probe().private_bytes;
+    return after > before ? after - before : 0;
+}
+
 // 计算文件或目录占用总字节数（目录递归求和；路径不存在/不可用返回 0）
 std::uintmax_t path_total_bytes(const std::string& p) {
     std::error_code ec;
@@ -273,6 +288,7 @@ struct AgentController::Impl {
         std::string state{"idle"};   // "idle" / "loading" / "ready"
         std::string path;            // 实际模型路径（可能为空）
         double load_ms{0.0};         // 最近一次加载耗时
+        std::uint64_t ram_bytes{0};  // 加载前后私有内存差值 = 该模型运行时占用
     };
     std::map<std::string, ModelInfo> models;
 
@@ -601,10 +617,12 @@ void AgentController::initModelsWork_(Impl* impl) {
     try {
         emit loadStageChanged(5, 9, kInitStages[4]);   // "加载 LLM 模型"
         auto t0 = std::chrono::steady_clock::now();
+        const std::uint64_t before = mem_probe().private_bytes;
         markModelLoading_("LLM", impl->cfg.llm_model);
         impl->llm->initialize(LLMConfig{impl->cfg.llm_model, kLLMGpuLayers});
         markModelReady_("LLM", std::chrono::duration<double, std::milli>(
                                    std::chrono::steady_clock::now() - t0).count());
+        setModelRam_("LLM", ram_delta_since(before));
     } catch (const std::exception& e) {
         emit logLine(QStringLiteral("LLM 加载失败：%1（回退 Mock）").arg(to_q(e.what())));
     }
@@ -612,14 +630,26 @@ void AgentController::initModelsWork_(Impl* impl) {
     try {
         emit loadStageChanged(6, 9, kInitStages[5]);   // "加载 VAD 模型"
         auto t0 = std::chrono::steady_clock::now();
-        markModelLoading_("VAD", impl->cfg.vad_model);
-        impl->vad->initialize(VADConfig{});
-        impl->vad->set_model_path(impl->cfg.vad_model,
-                                  impl->cfg.vad_model.empty()
-                                      ? std::string()
-                                      : impl->cfg.vad_model);
-        markModelReady_("VAD", std::chrono::duration<double, std::milli>(
-                                  std::chrono::steady_clock::now() - t0).count());
+        // 只有真正要用 VAD 才加载模型会话。默认是 PTT（手动按键），
+        // 切分靠"松开空格"这个明确动作，不需要 VAD 一直挂在内存里。
+        // initialize() 只算几个帧数常量（几十字节），模型才值钱。
+        if (impl->cfg.input_mode != "ptt") {
+            markModelLoading_("VAD", impl->cfg.vad_model);
+            const std::uint64_t before = mem_probe().private_bytes;
+            impl->vad->initialize(VADConfig{});
+            impl->vad->set_model_path(impl->cfg.vad_model,
+                                      impl->cfg.vad_model.empty()
+                                          ? std::string()
+                                          : impl->cfg.vad_model);
+            markModelReady_("VAD", std::chrono::duration<double, std::milli>(
+                                      std::chrono::steady_clock::now() - t0).count());
+            setModelRam_("VAD", ram_delta_since(before));
+        } else {
+            // 不加载：把状态标成"未加载"而不是"就绪"，让界面如实显示。
+            markModelIdle_("VAD", impl->cfg.vad_model);
+            emit logLine("输入方式为手动按键：VAD 模型不加载（省一份常驻内存），"
+                         "切到 VAD 自动切分时再按需加载。");
+        }
     } catch (const std::exception& e) {
         emit logLine(QStringLiteral("VAD 加载失败：%1（回退 Mock）").arg(to_q(e.what())));
     }
@@ -627,10 +657,12 @@ void AgentController::initModelsWork_(Impl* impl) {
     try {
         emit loadStageChanged(7, 9, kInitStages[6]);   // "加载 ASR 模型"
         auto t0 = std::chrono::steady_clock::now();
+        const std::uint64_t before = mem_probe().private_bytes;
         markModelLoading_("ASR", impl->cfg.asr_model);
         impl->asr->initialize(ASRConfig{impl->cfg.asr_model});
         markModelReady_("ASR", std::chrono::duration<double, std::milli>(
-                                  std::chrono::steady_clock::now() - t0).count());
+                                   std::chrono::steady_clock::now() - t0).count());
+        setModelRam_("ASR", ram_delta_since(before));
         emit logLine(QStringLiteral("ASR后端：%1")
                          .arg(impl->asr->uses_real_backend()
                                   ? QStringLiteral("Whisper(真实)")
@@ -643,11 +675,13 @@ void AgentController::initModelsWork_(Impl* impl) {
         emit loadStageChanged(8, 9, kInitStages[7]);   // "加载 TTS 模型"
         TTSConfig tc = tts_config_for_dir(impl->cfg.tts_model, impl->cfg);
         if (tc.engine.empty()) tc.engine = impl->cfg.tts_engine;
-        auto t0 = std::chrono::steady_clock::now();
+auto t0 = std::chrono::steady_clock::now();
         markModelLoading_("TTS", impl->cfg.tts_model);
+        const std::uint64_t before = mem_probe().private_bytes;
         impl->tts->initialize(tc);
         markModelReady_("TTS", std::chrono::duration<double, std::milli>(
-                                  std::chrono::steady_clock::now() - t0).count());
+                                   std::chrono::steady_clock::now() - t0).count());
+        setModelRam_("TTS", ram_delta_since(before));
         emit logLine(QStringLiteral("TTS后端：%1").arg(to_q(impl->tts->provider_label())));
     } catch (const std::exception& e) {
         emit logLine(QStringLiteral("TTS 加载失败：%1（回退 Mock）").arg(to_q(e.what())));
@@ -683,10 +717,12 @@ void AgentController::applyModelsWork_(Impl* impl, const ModelPaths& paths) {
     try {
         emit loadStageChanged(++step, total, kSwitchStages[step - 1]);
         auto t0 = std::chrono::steady_clock::now();
+        const std::uint64_t before = mem_probe().private_bytes;
         markModelLoading_("LLM", llmPath);
         impl->llm->initialize(LLMConfig{llmPath, kLLMGpuLayers});
         markModelReady_("LLM", std::chrono::duration<double, std::milli>(
-                                  std::chrono::steady_clock::now() - t0).count());
+                                   std::chrono::steady_clock::now() - t0).count());
+        setModelRam_("LLM", ram_delta_since(before));
     } catch (const std::exception& e) {
         emit errorLine(QStringLiteral("LLM 切换失败：%1").arg(to_q(e.what())));
     }
@@ -694,11 +730,20 @@ void AgentController::applyModelsWork_(Impl* impl, const ModelPaths& paths) {
     try {
         emit loadStageChanged(++step, total, kSwitchStages[step - 1]);
         auto t0 = std::chrono::steady_clock::now();
-        markModelLoading_("VAD", vadPath);
-        impl->vad->initialize(VADConfig{});
-        impl->vad->set_model_path(vadPath, vadPath);
-        markModelReady_("VAD", std::chrono::duration<double, std::milli>(
-                                  std::chrono::steady_clock::now() - t0).count());
+        if (impl->cfg.input_mode != "ptt") {
+            markModelLoading_("VAD", vadPath);
+            const std::uint64_t before = mem_probe().private_bytes;
+            impl->vad->initialize(VADConfig{});
+            impl->vad->set_model_path(vadPath, vadPath);
+            markModelReady_("VAD", std::chrono::duration<double, std::milli>(
+                                      std::chrono::steady_clock::now() - t0).count());
+            setModelRam_("VAD", ram_delta_since(before));
+        } else {
+            // 手动按键模式下连换模型都不必加载 VAD —— 直接把旧会话释放掉，
+            // 换的新路径等用户真切到 VAD 时再用。
+            impl->vad->unload();
+            markModelIdle_("VAD", vadPath);
+        }
     } catch (const std::exception& e) {
         emit errorLine(QStringLiteral("VAD 切换失败：%1").arg(to_q(e.what())));
     }
@@ -706,10 +751,12 @@ void AgentController::applyModelsWork_(Impl* impl, const ModelPaths& paths) {
     try {
         emit loadStageChanged(++step, total, kSwitchStages[step - 1]);
         auto t0 = std::chrono::steady_clock::now();
+        const std::uint64_t before = mem_probe().private_bytes;
         markModelLoading_("ASR", asrPath);
         impl->asr->initialize(ASRConfig{asrPath});
         markModelReady_("ASR", std::chrono::duration<double, std::milli>(
-                                  std::chrono::steady_clock::now() - t0).count());
+                                   std::chrono::steady_clock::now() - t0).count());
+        setModelRam_("ASR", ram_delta_since(before));
         emit logLine(QStringLiteral("ASR后端：%1")
                          .arg(impl->asr->uses_real_backend()
                                   ? QStringLiteral("Whisper(真实)")
@@ -722,11 +769,13 @@ void AgentController::applyModelsWork_(Impl* impl, const ModelPaths& paths) {
         emit loadStageChanged(++step, total, kSwitchStages[step - 1]);
         TTSConfig tc = tts_config_for_dir(ttsPath, impl->cfg);
         if (tc.engine.empty()) tc.engine = impl->cfg.tts_engine;
-        auto t0 = std::chrono::steady_clock::now();
+auto t0 = std::chrono::steady_clock::now();
         markModelLoading_("TTS", ttsPath);
+        const std::uint64_t before = mem_probe().private_bytes;
         impl->tts->initialize(tc);
         markModelReady_("TTS", std::chrono::duration<double, std::milli>(
-                                  std::chrono::steady_clock::now() - t0).count());
+                                   std::chrono::steady_clock::now() - t0).count());
+        setModelRam_("TTS", ram_delta_since(before));
         emit logLine(QStringLiteral("TTS后端：%1").arg(to_q(impl->tts->provider_label())));
     } catch (const std::exception& e) {
         emit errorLine(QStringLiteral("TTS 切换失败：%1").arg(to_q(e.what())));
@@ -938,6 +987,24 @@ void AgentController::markModelReady_(const std::string& key, double load_ms) {
     emitModelStatus_();
 }
 
+// 显式标成"未加载"（而不是等价的 idle）—— 界面据此显示"未加载（省内存）"，
+// 避免用户以为是自己没配好模型。
+void AgentController::markModelIdle_(const std::string& key, const std::string& path) {
+    if (!impl_) return;
+    auto& info = impl_->models[key];
+    info.state = "idle";
+    info.path = path;
+    info.load_ms = 0.0;
+    info.ram_bytes = 0;
+    emitModelStatus_();
+}
+
+// 记录某模型加载带来的私有内存增量。
+void AgentController::setModelRam_(const std::string& key, std::uint64_t bytes) {
+    if (!impl_) return;
+    impl_->models[key].ram_bytes = bytes;
+}
+
 void AgentController::emitModelStatus_() {
     if (!impl_) return;
 
@@ -947,7 +1014,9 @@ void AgentController::emitModelStatus_() {
             return {impl_->llm && impl_->llm->real_backend(),
                     std::string("llama.cpp")};
         if (key == "VAD")
-            return {!impl_->cfg.vad_model.empty() && impl_->vad != nullptr,
+            // 懒加载后"配了路径"≠"模型在内存里"，必须看真实会话状态，
+            // 否则 PTT 模式下界面会显示一个并不存在的 Silero 就绪。
+            return {impl_->vad && impl_->vad->model_loaded(),
                     std::string("Silero")};
         if (key == "ASR")
             // 注意：pair 第二个元素不参与 && 短路，必须显式判空
@@ -998,8 +1067,21 @@ void AgentController::emitModelStatus_() {
             ? to_q(backendName) : QStringLiteral("Mock占位");
         x[QStringLiteral("provider")] = to_q(provider_of(key));
         x[QStringLiteral("load_ms")] = info.load_ms;
+        // 运行时占用（私有内存增量）。比 size_bytes 更能回答"到底吃了多少内存"。
+        x[QStringLiteral("ram_bytes")] = static_cast<qint64>(info.ram_bytes);
         m[QString::fromUtf8(ck)] = x;
     }
+
+    // 进程 / 系统总量：给内存面板提供画比例的分母
+    const MemSample sm = mem_probe();
+    m[QStringLiteral("_proc")] = QVariantMap{
+        {QStringLiteral("private_bytes"), static_cast<qint64>(sm.private_bytes)},
+        {QStringLiteral("working_set"), static_cast<qint64>(sm.working_set)},
+        {QStringLiteral("sys_total"), static_cast<qint64>(sm.sys_total)},
+        {QStringLiteral("sys_available"), static_cast<qint64>(sm.sys_available)},
+        {QStringLiteral("valid"), sm.valid},
+    };
+
     emit modelStatus(m);
 }
 
@@ -1057,13 +1139,69 @@ void AgentController::handleSetTtsParams_(double speed, double pitch, int speake
 }
 
 void AgentController::handleSetVad_(bool enabled) {
-    vad_enabled_.store(enabled);
+    const bool wasEnabled = vad_enabled_.exchange(enabled);
     if (impl_) impl_->cfg.input_mode = enabled ? "vad" : "ptt";
     if (impl_ && impl_->orch) impl_->orch->set_vad_enabled(enabled);
+
+    // VAD 模型懒加载：ONNX session 是 VAD 唯一的大块内存开销，
+    // 而手动按键（PTT）模式下压根不跑推理 —— 没理由为它常驻。
+    // 切到 VAD 才加载，切回 PTT 立刻释放。
+    if (impl_ && impl_->vad && wasEnabled != enabled) {
+        if (enabled) {
+            ensureVadModel_("切到 VAD 自动切分");
+        } else {
+            const MemSample before = mem_probe();
+            impl_->vad->unload();
+            const MemSample after = mem_probe();
+            const std::uint64_t freed =
+                before.private_bytes > after.private_bytes
+                    ? before.private_bytes - after.private_bytes : 0;
+            setModelRam_("VAD", 0);
+            emit logLine(QStringLiteral("已释放 VAD 模型，回收私有内存约 %1。")
+                             .arg(to_q(format_bytes(freed))));
+            emitModelStatus_();
+        }
+    }
+
     if (impl_) persistConfig_();
     emit vadEnabledChanged(enabled);
     emit logLine(enabled ? QStringLiteral("VAD 端点检测已开启（自动切分语音段）。")
                          : QStringLiteral("已切换为手动按键：按住空格/🎙 说话，松开转写。"));
+}
+
+// 按需加载 VAD 模型（幂等：已加载则直接返回，不重复花时间和内存）。
+void AgentController::ensureVadModel_(const char* reason) {
+    if (!impl_ || !impl_->vad) return;
+    if (impl_->vad->model_loaded()) return;
+
+    const std::string path = impl_->cfg.vad_model;
+    markModelLoading_("VAD", path);
+    auto t0 = std::chrono::steady_clock::now();
+    const std::uint64_t before = mem_probe().private_bytes;
+    try {
+        impl_->vad->initialize(VADConfig{});
+        impl_->vad->set_model_path(path, path);
+    } catch (const std::exception& e) {
+        emit errorLine(QStringLiteral("VAD 加载失败：%1（退回能量检测）").arg(to_q(e.what())));
+    }
+    const std::uint64_t after = mem_probe().private_bytes;
+    const double ms = std::chrono::duration<double, std::milli>(
+                          std::chrono::steady_clock::now() - t0).count();
+
+    if (impl_->vad->model_loaded()) {
+        markModelReady_("VAD", ms);
+        const std::uint64_t delta = after > before ? after - before : 0;
+        setModelRam_("VAD", delta);
+        emit logLine(QStringLiteral("VAD 模型已加载（%1）：%2，私有内存 +%3")
+                         .arg(to_q(std::string(reason)),
+                              to_q(format_bytes(delta))));
+    } else {
+        // 没真加载上（文件缺失 / 无 ONNX Runtime）：状态机留在"未加载"，
+        // 能量检测仍能工作，只是不如真模型准。
+        emitModelStatus_();
+        emit logLine("VAD 模型文件不可用，当前使用能量检测（切分精度会下降）。");
+    }
+    emitModelStatus_();
 }
 
 void AgentController::handleSetBargeIn_(bool enabled, int minSpeechMs,

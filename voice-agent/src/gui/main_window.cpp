@@ -42,6 +42,7 @@
 
 #include "gui/settings_panel.hpp"
 #include "gui/latency_panel.hpp"
+#include "gui/memory_panel.hpp"
 
 namespace voice_agent {
 namespace gui {
@@ -621,7 +622,20 @@ void MainWindow::buildRightSidebar_() {
     tlLayout->addStretch(1);
     rightTabs_->addTab(tlPage, QStringLiteral("耗时"));
 
+    // 内存：进程/系统占比 + 各模型占用条（常显的问题"谁在吃内存"放这里最直观）
+    memPanel_ = new MemoryPanel(rightTabs_);
+    rightTabs_->addTab(memPanel_, QStringLiteral("内存"));
+
     r->addWidget(rightTabs_, 1);
+
+    // 每 2s 刷新一次内存面板：读一次进程计数器是微秒级开销，
+    // 但没必要跟 levelTimer_ 那样 80ms 刷一次。
+    memTimer_ = new QTimer(this);
+    memTimer_->setInterval(2000);
+    connect(memTimer_, &QTimer::timeout, this, [this] {
+        if (memPanel_) memPanel_->refresh();
+    });
+    memTimer_->start();
 }
 
 void MainWindow::connectSignals_() {
@@ -733,6 +747,11 @@ void MainWindow::connectSignals_() {
     connect(controller_, &AgentController::modelStatus, this, &MainWindow::onModelStatus);
     connect(controller_, &AgentController::stageTiming, this, &MainWindow::onStageTiming);
     connect(controller_, &AgentController::turnTimeline, this, &MainWindow::onTurnTimeline);
+    // 内存面板除了自己定时采样，还需要模型的占用数字（加载时才测得准），
+    // 所以这条信号里捎带的 ram_bytes 必须喂给它。
+    connect(controller_, &AgentController::modelStatus, this, [this](const QVariantMap& m) {
+        if (memPanel_) memPanel_->onModelStatus(m);
+    });
 
     // 后台初始化/切换模型进度 → 进度条、状态栏、按钮可用性
     connect(controller_, &AgentController::loadStageChanged,
@@ -1139,6 +1158,7 @@ void MainWindow::onModelStatus(const QVariantMap& models) {
         const QString file = QFileInfo(x.value(QStringLiteral("path")).toString())
                                  .fileName();
         const qint64 bytes = x.value(QStringLiteral("size_bytes")).toLongLong();
+        const qint64 ram = x.value(QStringLiteral("ram_bytes")).toLongLong();
         const QString backend = x.value(QStringLiteral("backend")).toString();
         const QString provider = x.value(QStringLiteral("provider")).toString();
         const double loadMs = x.value(QStringLiteral("load_ms")).toDouble();
@@ -1149,8 +1169,15 @@ void MainWindow::onModelStatus(const QVariantMap& models) {
             : (bytes >= 1024 * 1024
                    ? QStringLiteral("%1 MB").arg(bytes / (1024.0 * 1024.0), 0, 'f', 1)
                    : QStringLiteral("%1 KB").arg(bytes / 1024.0, 0, 'f', 0));
+        // 运行时内存（加载前后私有内存增量），比磁盘大小更贴近真实占用
+        const QString ramTxt = ram <= 0 ? QString()
+            : (ram >= 1024 * 1024
+                   ? QStringLiteral("内存 %1 MB").arg(ram / (1024.0 * 1024.0), 0, 'f', 0)
+                   : QStringLiteral("内存 %1 KB").arg(ram / 1024.0, 0, 'f', 0));
         const QString loadTxt = loadMs <= 0 ? QString()
             : QStringLiteral(" · 加载 %1ms").arg(loadMs, 0, 'f', 1);
+
+        const bool isVad = qstrcmp(keys[i], "VAD") == 0;
 
         QString status;          // 中文状态词
         QString baseStyle =
@@ -1165,6 +1192,10 @@ void MainWindow::onModelStatus(const QVariantMap& models) {
         } else if (state == QLatin1String("ready")) {
             status = QStringLiteral("就绪");
             baseStyle += QStringLiteral("border:1px solid #2f4a38;background:#1e2f24;");
+        } else if (isVad && !controller_->vadEnabled()) {
+            // 刻意不加载 ≠ 没配好：说清楚这是省内存的结果，切一下就加载
+            status = QStringLiteral("未加载·省内存");
+            baseStyle += QStringLiteral("border:1px solid #2f4a38;background:#1b2620;color:#8ab4a0;");
         } else {
             status = QStringLiteral("未加载");
             baseStyle += QStringLiteral("border:1px solid #3d3d3d;background:#262626;color:#9b9b9b;");
@@ -1176,22 +1207,26 @@ void MainWindow::onModelStatus(const QVariantMap& models) {
             chip += QStringLiteral(" · %1").arg(escHtml(disp));
         if (realBackend && !provider.isEmpty() && provider != QLatin1String("Mock"))
             chip += QStringLiteral(" · %1").arg(escHtml(provider));
-        if (loadMs > 0 || bytes > 0) {
-            chip += QStringLiteral(
-                        "<br><span style='color:#9b9b9b;font-size:11px;'>%1 · %2%3</span>")
-                        .arg(escHtml(file), sizeTxt, loadTxt);
+        if (loadMs > 0 || bytes > 0 || !ramTxt.isEmpty()) {
+            QString line = QStringLiteral("%1 · %2").arg(escHtml(file), sizeTxt);
+            if (!ramTxt.isEmpty())
+                line += QStringLiteral(" · %1").arg(ramTxt);
+            chip += QStringLiteral("<br><span style='color:#9b9b9b;font-size:11px;'>%1%2</span>")
+                        .arg(line, loadTxt);
         }
         modelChips_[i]->setTextFormat(Qt::RichText);
         modelChips_[i]->setText(chip);
         modelChips_[i]->setStyleSheet(baseStyle);
         modelChips_[i]->setToolTip(x.isEmpty()
             ? QStringLiteral("尚未上报状态")
-            : QStringLiteral("后端：%1\n推理：%2\n型号：%3\n文件：%4\n占用：%5\n加载耗时：%6 ms")
+            : QStringLiteral("后端：%1\n推理：%2\n型号：%3\n文件：%4\n"
+                             "磁盘：%5\n运行时内存：%6\n加载耗时：%7 ms")
                   .arg(backend,
                        provider.isEmpty() ? QStringLiteral("—") : provider,
                        disp,
                        x.value(QStringLiteral("path")).toString(),
                        sizeTxt,
+                       ram <= 0 ? QStringLiteral("未占用") : ramTxt,
                        QString::number(loadMs, 'f', 1)));
     }
 }

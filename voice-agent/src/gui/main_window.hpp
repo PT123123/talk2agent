@@ -33,6 +33,7 @@ namespace voice_agent {
 namespace gui {
 
 class SettingsPanel;
+class MemoryPanel;
 
 // ========== 主窗口 ==========
 // ChatGPT 式三栏布局：
@@ -190,6 +191,8 @@ private:
     QTableWidget* timelineTable_ = nullptr;
     QLabel* timelineSummary_ = nullptr;
     QLabel* timelineHist_ = nullptr;   // 最近几轮汇总
+    MemoryPanel* memPanel_ = nullptr;   // 右栏"内存"页
+    QTimer* memTimer_ = nullptr;        // 内存面板刷新节拍（2s）
     QHash<QString, double> liveStages_;
     int liveTools_ = 0;
     bool liveActive_ = false;

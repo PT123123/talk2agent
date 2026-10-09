@@ -273,3 +273,12 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/test_barge_in_control.cpp)
     voice_agent_test_env(test_barge_in_control)
     voice_agent_test_copy_rt(test_barge_in_control)
 endif()
+
+# 内存预算测试（VAD 懒加载状态 + input_mode 门控 + mem_probe/format_bytes）
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/test_mem_budget.cpp)
+    add_executable(test_mem_budget test_mem_budget.cpp)
+    target_link_libraries(test_mem_budget PRIVATE voice_agent_core)
+    add_test(NAME test_mem_budget COMMAND test_mem_budget)
+    voice_agent_test_env(test_mem_budget)
+    voice_agent_test_copy_rt(test_mem_budget)
+endif()

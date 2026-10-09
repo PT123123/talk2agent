@@ -46,6 +46,15 @@ public:
     // 手动设置模型路径（可选）
     void set_model_path(const std::string& ten_vad_path, const std::string& silero_path = "");
 
+    // 是否有真实模型会话在内存里（Silero 或 ten-vad 任一加载成功）。
+    // 未加载时 process() 走纯能量检测 —— 判断"现在到底吃没吃这份内存"看这个。
+    bool model_loaded() const;
+
+    // 释放模型会话，回到纯能量检测。用于输入方式从 VAD 切回手动按键时
+    // 把这份内存还给系统（ONNX session 是 VAD 唯一的大块开销）。
+    // 幂等：没加载过也不报错。
+    void unload();
+
     // 处理音频数据（16kHz, 16-bit PCM）
     // 返回: 是否检测到语音
     bool process(const int16_t* pcm_data, size_t frames);

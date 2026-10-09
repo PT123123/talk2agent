@@ -226,6 +226,7 @@ set(CORE_SOURCES
     src/util/voice_trace.cpp
     src/util/latency_metrics.cpp
     src/util/gpu.cpp
+    src/util/mem_probe.cpp
     src/audio/audio_device.cpp
     src/audio/audio_pipeline.cpp
     src/audio/echo_cancellation.cpp
@@ -361,16 +362,18 @@ if(BUILD_GUI)
             src/gui/model_downloader.cpp
             src/gui/settings_panel.cpp
             src/gui/latency_panel.cpp
+            src/gui/memory_panel.cpp
             src/gui/main_window.hpp
             src/gui/agent_controller.hpp
             src/gui/model_catalog.hpp
             src/gui/model_downloader.hpp
             src/gui/settings_panel.hpp
             src/gui/latency_panel.hpp
+            src/gui/memory_panel.hpp
         )
         add_executable(voice-agent WIN32 ${GUI_SOURCES})
         target_include_directories(voice-agent PRIVATE src ${CMAKE_SOURCE_DIR}/third_party)
-        target_link_libraries(voice-agent PRIVATE voice_agent_core Qt6::Widgets Qt6::Core Qt6::Network dwmapi.lib)
+        target_link_libraries(voice-agent PRIVATE voice_agent_core Qt6::Widgets Qt6::Core Qt6::Network dwmapi.lib psapi.lib)
         set_target_properties(voice-agent PROPERTIES
             AUTOMOC ON
             WIN32_EXECUTABLE TRUE

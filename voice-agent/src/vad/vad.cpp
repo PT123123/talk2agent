@@ -461,6 +461,46 @@ void VAD::set_model_path(const std::string& ten_vad_path, const std::string& sil
     impl_->load_ten_vad(ten_vad_path);
 }
 
+bool VAD::model_loaded() const {
+    if (!impl_) return false;
+#ifdef USE_ONNXRUNTIME
+    return impl_->silero_loaded || impl_->ten_vad_session != nullptr;
+#else
+    return false;
+#endif
+}
+
+void VAD::unload() {
+    if (!impl_) return;
+#ifdef USE_ONNXRUNTIME
+    // 先释放 session 再清状态：session 是权重所在，唯一的大块内存。
+    // Ort::Env 保留 —— 它只是日志级别/allocator 的持有者，几十 KB，
+    // 重建它反而会让下次 set_model_path 多一次初始化开销。
+    impl_->silero_session.reset();
+    impl_->ten_vad_session.reset();
+    impl_->silero_loaded = false;
+    impl_->silero_states.clear();
+    impl_->silero_state_names.clear();
+    impl_->silero_state_shapes.clear();
+    impl_->silero_out_names.clear();
+    impl_->silero_wav_name.clear();
+    impl_->silero_pcm_buf.clear();
+    impl_->silero_has_sr = false;
+    impl_->silero_sr_name.clear();
+#endif
+    // 30ms/帧（Silero 口径）换回默认帧长，否则残留的换算会让
+    // 下次重新加载能量检测时帧数门槛对不上。
+    if (impl_->config.frame_length_ms > 0) {
+        impl_->min_speech_frames = impl_->config.min_speech_duration_ms /
+                                    impl_->config.frame_length_ms;
+        impl_->min_silence_frames = impl_->config.min_silence_duration_ms /
+                                    impl_->config.frame_length_ms;
+    }
+    is_speaking_ = false;
+    speech_prob_ = 0.0f;
+    last_inference_ms.store(0.0);
+}
+
 bool VAD::process(const int16_t* pcm_data, size_t frames) {
     if (frames == 0) return false;
 
@@ -516,6 +556,9 @@ void VAD::set_callback(VADCallback callback) {
 
 std::string VAD::provider_label() const {
     if (!impl_) return "Mock";
+    // 没加载模型时不报"CPU"—— 那会让人以为有一个能量检测在跑，
+    // 实际上是"这一份内存压根没花"。
+    if (!model_loaded()) return "未加载";
     return impl_->provider_;
 }
 
