@@ -1,6 +1,7 @@
 // src/llm/llm.cpp
 #include "llm.hpp"
 #include "util/log.hpp"
+#include "util/paths.hpp"
 
 #ifdef USE_LLAMACPP
 #include "llama.h"
@@ -40,7 +41,7 @@ std::string mock_reply(const std::string& prompt) {
     if (last_user.empty()) last_user = prompt;
     return "（Mock 模式）您说：「" + last_user +
            "」。当前没有加载真实 LLM 模型，请在“设置”页下载 GGUF 模型，"
-           "或确认 models/llm 下已有模型文件。";
+           "或确认 " + voice_agent::models_root() + "/llm 下已有模型文件。";
 }
 }  // namespace
 

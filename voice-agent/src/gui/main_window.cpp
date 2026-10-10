@@ -30,6 +30,7 @@
 #include <QScrollArea>
 #include <QSplitter>
 #include <QStackedWidget>
+#include <QStyle>
 #include <QTableWidget>
 #include <QTabWidget>
 #include <QTextCursor>
@@ -51,6 +52,15 @@ namespace {
 
 QString escHtml(QString s) {
     return s.toHtmlEscaped();
+}
+
+// 日志用文本预览：压平换行 + 截断，避免长回复把日志行撑爆。
+// 返回 std::string —— fmt/spdlog 不认 QString（fallback_formatter 无法 parse）。
+std::string logPreview(const QString& text, int max = 40) {
+    QString flat = text;
+    flat.replace(QLatin1Char('\n'), QLatin1String("\\n"));
+    if (flat.size() > max) flat = flat.left(max) + QStringLiteral("…");
+    return flat.toStdString();
 }
 
 // ===== 全局暗色主题（Chat 深色风格：深灰分层、圆角、微分割线）=====
@@ -95,6 +105,7 @@ QLabel#avatar { background:#10a37f; color:#ffffff; border-radius:12px;
 
 /* ---- 输入卡 ---- */
 #composer { background:#2f2f2f; border:1px solid #3d3d3d; border-radius:22px; }
+#composer[recording="true"] { border:1px solid #b3261e; }
 QLineEdit#composerInput { background:transparent; border:none; font-size:14px; }
 QPushButton#sendBtn { background:#ffffff; color:#0d0d0d; border:none;
                       border-radius:19px; font-size:16px; }
@@ -111,6 +122,13 @@ QToolButton#chipToggle:hover { background:#3a3a3a; }
 QToolButton#chipToggle:checked { background:#22324d; border-color:#2f4a73; color:#8ab4f8; }
 QLabel#composerHint { color:#6f6f6f; font-size:11px; }
 QFrame#initBanner { background:#1c2a40; border:1px solid #2f4a73; border-radius:12px; }
+
+/* ---- PTT 按住说话遮罩（按下空格立即出现，松开隐藏） ---- */
+#pttOverlay { background:rgba(0,0,0,120); }
+#pttCard { background:#2f2f2f; border:1px solid #b3261e; border-radius:18px; }
+#pttDot { color:#ff6b6b; font-size:26px; }
+#pttTitle { font-size:16px; font-weight:600; color:#ececec; }
+#pttSub { color:#9b9b9b; font-size:12px; }
 
 /* ---- 右栏：模型/流程 chips、日志、耗时 ---- */
 QTabWidget::pane { border:none; background:transparent; }
@@ -224,6 +242,11 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
 }
 
 bool MainWindow::eventFilter(QObject* watched, QEvent* event) {
+    // 对话区尺寸变化时保持遮罩覆盖（遮罩是 chatPage_ 的绝对定位子控件）
+    if (watched == chatPage_ && event->type() == QEvent::Resize &&
+        pttOverlay_ && pttOverlay_->isVisible()) {
+        pttOverlay_->setGeometry(chatPage_->rect());
+    }
     if (event->type() == QEvent::KeyPress || event->type() == QEvent::KeyRelease) {
         auto* ke = static_cast<QKeyEvent*>(event);
         // 空格 + 无修饰键 → 对讲机式按说；屏蔽 IME 组合期间的按键
@@ -238,6 +261,7 @@ bool MainWindow::eventFilter(QObject* watched, QEvent* event) {
                     }
                     pttHolding_ = true;
                     pttKeyDownSeen_ = true;
+                    showPttOverlay_();   // 按下立即提示，不等工作线程确认
                     if (controller_->vadEnabled()) {
                         voiceBtn_->setChecked(true);   // 触发 onVoiceToggled(true) → startVoice
                     } else {
@@ -250,6 +274,7 @@ bool MainWindow::eventFilter(QObject* watched, QEvent* event) {
                 if (pttHolding_) {
                     pttHolding_ = false;
                     pttKeyDownSeen_ = false;
+                    hidePttOverlay_();
                     if (controller_->vadEnabled()) {
                         voiceBtn_->setChecked(false);  // 触发 onVoiceToggled(false) → stopVoice
                     } else {
@@ -272,6 +297,7 @@ void MainWindow::releasePtt_() {
     if (!pttHolding_ && !pttKeyDownSeen_) return;
     pttHolding_ = false;
     pttKeyDownSeen_ = false;
+    hidePttOverlay_();
     if (!controller_) return;
 
     // voiceBtn_ 在 VAD 模式下就是录音态高亮，必须一起取消，
@@ -297,6 +323,33 @@ void MainWindow::changeEvent(QEvent* event) {
 void MainWindow::closeEvent(QCloseEvent* event) {
     releasePtt_();   // 别让麦克风被窗口关闭带着一起挂住
     QMainWindow::closeEvent(event);
+}
+
+// ========== PTT 按住说话的界面提示 ==========
+// 遮罩在按下空格的一瞬间出现（不等工作线程的 audioStarted 确认），
+// 给出"正在录音"的强视觉反馈；松开 / 失焦兜底时立即隐藏。
+
+void MainWindow::showPttOverlay_() {
+    if (!pttOverlay_) return;
+    pttOverlay_->setGeometry(chatPage_->rect());
+    pttOverlay_->raise();
+    pttOverlay_->show();
+    pttPulseOn_ = false;
+    if (pttPulseTimer_ && !pttPulseTimer_->isActive()) pttPulseTimer_->start();
+}
+
+void MainWindow::hidePttOverlay_() {
+    if (pttPulseTimer_) pttPulseTimer_->stop();
+    if (pttOverlay_) pttOverlay_->hide();
+}
+
+// 输入卡录音态红边：麦克风实际开启/关闭时切换（🎙 按钮与空格两种来源都走这里）
+void MainWindow::setComposerRecording_(bool on) {
+    if (!composerFrame_) return;
+    if (composerFrame_->property("recording").toBool() == on) return;
+    composerFrame_->setProperty("recording", on);
+    composerFrame_->style()->unpolish(composerFrame_);
+    composerFrame_->style()->polish(composerFrame_);
 }
 
 void MainWindow::buildUi_() {
@@ -480,12 +533,12 @@ void MainWindow::buildChatPage_() {
     initLayout->addWidget(loadProgress_);
     bl->addWidget(initBox_);
 
-    auto* composer = new QFrame(bottom);
-    composer->setObjectName("composer");
-    auto* cv = new QVBoxLayout(composer);
+    composerFrame_ = new QFrame(bottom);
+    composerFrame_->setObjectName("composer");
+    auto* cv = new QVBoxLayout(composerFrame_);
     cv->setContentsMargins(16, 10, 10, 10);
     cv->setSpacing(6);
-    input_ = new QLineEdit(composer);
+    input_ = new QLineEdit(composerFrame_);
     input_->setObjectName("composerInput");
     input_->setPlaceholderText(
         QStringLiteral("输入消息，回车发送（支持 /memory save|list|query|clear）…"));
@@ -494,22 +547,22 @@ void MainWindow::buildChatPage_() {
 
     auto* ctrlRow = new QHBoxLayout;
     ctrlRow->setSpacing(6);
-    voiceBtn_ = new QPushButton(QStringLiteral("🎙"), composer);
+    voiceBtn_ = new QPushButton(QStringLiteral("🎙"), composerFrame_);
     voiceBtn_->setObjectName("iconBtn");
     voiceBtn_->setCheckable(true);
     voiceBtn_->setFixedSize(38, 38);
     voiceBtn_->setToolTip(QStringLiteral("开始 / 停止语音（按住空格可即按即说）"));
-    speakBtn_ = new QPushButton(QStringLiteral("🔊"), composer);
+    speakBtn_ = new QPushButton(QStringLiteral("🔊"), composerFrame_);
     speakBtn_->setObjectName("iconBtn");
     speakBtn_->setFixedSize(38, 38);
     speakBtn_->setToolTip(QStringLiteral("朗读最近一次回复"));
-    ttsToggle_ = new QToolButton(composer);
+    ttsToggle_ = new QToolButton(composerFrame_);
     ttsToggle_->setObjectName("chipToggle");
     ttsToggle_->setText(QStringLiteral("播报"));
     ttsToggle_->setCheckable(true);
     ttsToggle_->setChecked(true);
     ttsToggle_->setToolTip(QStringLiteral("TTS 语音播报开关（关闭后仅显示文字）"));
-    vadToggle_ = new QToolButton(composer);
+    vadToggle_ = new QToolButton(composerFrame_);
     vadToggle_->setObjectName("chipToggle");
     vadToggle_->setText(QStringLiteral("VAD"));
     vadToggle_->setCheckable(true);
@@ -520,7 +573,7 @@ void MainWindow::buildChatPage_() {
         "关闭（默认）：按住空格/🎙 说话，松开即转写。\n"
         "开启：麦克风常开，自动检测说话起止。\n"
         "完整设置在「设置 → 播报与交互 → 语音输入方式」。"));
-    sendBtn_ = new QPushButton(QStringLiteral("➤"), composer);
+    sendBtn_ = new QPushButton(QStringLiteral("➤"), composerFrame_);
     sendBtn_->setObjectName("sendBtn");
     sendBtn_->setFixedSize(38, 38);
     sendBtn_->setToolTip(QStringLiteral("发送"));
@@ -531,7 +584,7 @@ void MainWindow::buildChatPage_() {
     ctrlRow->addStretch(1);
     ctrlRow->addWidget(sendBtn_);
     cv->addLayout(ctrlRow);
-    bl->addWidget(composer);
+    bl->addWidget(composerFrame_);
 
     auto* hint = new QLabel(
         QStringLiteral("回车发送 · 按住空格说话 · 语音状态见顶部胶囊 · 流程与日志在右栏"), bottom);
@@ -540,6 +593,46 @@ void MainWindow::buildChatPage_() {
     bl->addWidget(hint);
 
     dlg->addWidget(bottom);
+
+    // ---- PTT 按住说话遮罩：按住空格立即覆盖对话区，松开隐藏 ----
+    // 鼠标穿透（WA_TransparentForMouseEvents），不影响下方控件交互。
+    pttOverlay_ = new QFrame(chatPage_);
+    pttOverlay_->setObjectName("pttOverlay");
+    pttOverlay_->setAttribute(Qt::WA_TransparentForMouseEvents);
+    pttOverlay_->setFocusPolicy(Qt::NoFocus);
+    auto* ovL = new QVBoxLayout(pttOverlay_);
+    ovL->setAlignment(Qt::AlignCenter);
+    auto* card = new QFrame(pttOverlay_);
+    card->setObjectName("pttCard");
+    auto* cl = new QVBoxLayout(card);
+    cl->setContentsMargins(30, 22, 30, 18);
+    cl->setSpacing(6);
+    cl->setAlignment(Qt::AlignHCenter);
+    pttDot_ = new QLabel(QStringLiteral("●"), card);
+    pttDot_->setObjectName("pttDot");
+    pttDot_->setAlignment(Qt::AlignCenter);
+    auto* pttTitle = new QLabel(QStringLiteral("正在录音"), card);
+    pttTitle->setObjectName("pttTitle");
+    pttTitle->setAlignment(Qt::AlignCenter);
+    auto* pttSub = new QLabel(QStringLiteral("松开空格结束"), card);
+    pttSub->setObjectName("pttSub");
+    pttSub->setAlignment(Qt::AlignCenter);
+    cl->addWidget(pttDot_);
+    cl->addWidget(pttTitle);
+    cl->addWidget(pttSub);
+    ovL->addWidget(card);
+    pttOverlay_->hide();
+
+    // 红点脉冲：450ms 亮灭交替
+    pttPulseTimer_ = new QTimer(this);
+    pttPulseTimer_->setInterval(450);
+    connect(pttPulseTimer_, &QTimer::timeout, this, [this] {
+        pttPulseOn_ = !pttPulseOn_;
+        if (pttDot_)
+            pttDot_->setStyleSheet(QStringLiteral("color:%1;")
+                .arg(pttPulseOn_ ? QStringLiteral("#ff6b6b")
+                                 : QStringLiteral("#7a3232")));
+    });
 }
 
 // ========== 右栏：模型状态 + 处理流程 + 日志/耗时标签页（可折叠） ==========
@@ -717,10 +810,12 @@ void MainWindow::connectSignals_() {
                                  ? QStringLiteral("监听中 · VAD 自动切分")
                                  : QStringLiteral("录音中 · 结束即转写"));
         setPipelineStep_(0);
+        setComposerRecording_(true);   // 输入卡红边：麦克风已开（空格/🎙 通用）
     });
     connect(controller_, &AgentController::audioStopped, this, [this] {
         QSignalBlocker b(voiceBtn_);
         voiceBtn_->setChecked(false);
+        setComposerRecording_(false);
         updateVadHint_();
     });
     connect(controller_, &AgentController::voicePlaying, this,
@@ -764,6 +859,7 @@ void MainWindow::onSendClicked() {
     const QString text = input_->text().trimmed();
     if (text.isEmpty()) return;
     input_->clear();
+    LOG_INFO("[UI] 发送文本 len={} '{}'", text.size(), logPreview(text));
     controller_->sendText(text);
 }
 
@@ -908,8 +1004,13 @@ void MainWindow::onMemoryActivated_(QListWidgetItem* item) {
 // 把消息行插入到流末尾（空态与 stretch 之前），并按需贴底
 void MainWindow::insertChatRow_(QWidget* row) {
     emptyState_->setVisible(false);
-    // 布局末尾固定为 [emptyState_, stretch]，消息插在它们之前
-    chatLayout_->insertWidget(qMax(0, chatLayout_->count() - 2), row);
+    // 布局末尾固定为 [emptyState_, stretch]，消息插在它们之前。
+    // idx 应恒等于当前消息行数（count-2）；若日志里出现 idx 小于该值，
+    // 说明有代码破坏了"末尾两项固定"的布局约定 —— 气泡会插进历史中间。
+    const int idx = qMax(0, chatLayout_->count() - 2);
+    chatLayout_->insertWidget(idx, row);
+    LOG_INFO("[UI] insertRow idx={} (布局共 {} 项，末尾固定为 emptyState+stretch)",
+             idx, chatLayout_->count());
     scrollChatToBottom_();
 }
 
@@ -973,6 +1074,8 @@ void MainWindow::appendChatBubble_(const QString& text, bool isUser) {
 }
 
 void MainWindow::onUserMessage_(const QString& text, bool fromVoice) {
+    LOG_INFO("[UI] 用户消息 fromVoice={} len={} '{}'",
+             fromVoice, text.size(), logPreview(text));
     resetLive_();
     appendChatBubble_(text, /*isUser=*/true);
     if (fromVoice) {
@@ -988,18 +1091,35 @@ void MainWindow::onUserMessage_(const QString& text, bool fromVoice) {
 void MainWindow::appendToken_(const QString& token) {
     const bool first = pendingAssistant_.isEmpty();
     pendingAssistant_ += token;
+    const bool created = (streamingLabel_ == nullptr);
     if (!streamingLabel_) streamingLabel_ = createAssistantRow_();
     streamingLabel_->setText(pendingAssistant_);
     scrollChatToBottom_();
-    if (first) LOG_INFO("SA_LIVE first token arrived, len=%d", token.size());
+    if (first) {
+        // 正常路径 created 必为 true；若复用旧行说明状态复位没接住，
+        // 新回答会打到上一轮的气泡里 —— 用 WARN 让它在日志里跳出来。
+        LOG_INFO("[UI] 首 token len={} 累计={} 流式气泡={}",
+                 token.size(), pendingAssistant_.size(),
+                 created ? "新建" : "复用旧行");
+        if (!created)
+            LOG_WARN("[UI] 首 token 复用了已有流式气泡 —— 新回答将与上一轮内容串在一起！");
+    } else if (pendingAssistant_.size() >= nextTokenLogLen_) {
+        // 周期性进度（默认每 256 字符一档）：能看出流式是否还在推进、推进到哪个气泡
+        LOG_INFO("[UI] 流式中 len={}", pendingAssistant_.size());
+        nextTokenLogLen_ += 256;
+    }
 }
 
 void MainWindow::appendAssistantFinal_(const QString& finalText) {
     // 流式已在对话流里生成气泡：只需收尾；无流式时回退到最终文本
     const bool streamed = streamingLabel_ != nullptr;
     const QString text = pendingAssistant_.isEmpty() ? finalText : pendingAssistant_;
+    LOG_INFO("[UI] 回答收尾 streamed={} 展示 len={} (streamBuf={} finalCb={}) '{}'",
+             streamed, text.size(), pendingAssistant_.size(), finalText.size(),
+             logPreview(text));
     streamingLabel_ = nullptr;
     pendingAssistant_.clear();
+    nextTokenLogLen_ = 256;
     if (streamed) {
         scrollChatToBottom_();
         return;
@@ -1266,6 +1386,7 @@ QString MainWindow::statusTextFor_(const QString& state) const {
 }
 
 void MainWindow::onStateChanged_(const QString& state) {
+    LOG_INFO("[UI] 状态 -> {}", state.toStdString());
     if (state == QLatin1String("Interrupting")) {
         turnWasInterrupted_ = true;
     } else if (state == QLatin1String("Thinking")) {
@@ -1300,6 +1421,17 @@ void MainWindow::resetLive_() {
     liveStages_.clear();
     liveTools_ = 0;
     liveActive_ = true;
+    // 上一轮流式气泡若未正常收尾（打断/异常路径没走 appendAssistantFinal_），
+    // streamingLabel_ 会一直指向旧回答 —— 下一轮 token 会追加进上几段的旧
+    // 气泡里（表现为"正在打的字出现在上面几段回答中"）。这里统一封口：
+    // 残留文本留在旧气泡里作历史，新 token 一律开新气泡。
+    if (streamingLabel_) {
+        LOG_WARN("[UI] 封口未收尾的流式气泡（上一轮被打断/异常结束），残留 {} 字符",
+                 pendingAssistant_.size());
+        streamingLabel_ = nullptr;
+    }
+    if (!pendingAssistant_.isEmpty()) pendingAssistant_.clear();
+    nextTokenLogLen_ = 256;
     refreshTimelineTable_();
 }
 

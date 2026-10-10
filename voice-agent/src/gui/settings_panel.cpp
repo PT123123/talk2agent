@@ -4,6 +4,7 @@
 #include "gui/model_catalog.hpp"
 #include "gui/latency_panel.hpp"
 #include "audio/audio_device.hpp"
+#include "util/paths.hpp"
 
 #include <QCheckBox>
 #include <QComboBox>
@@ -14,6 +15,7 @@
 #include <QProgressBar>
 #include <QPushButton>
 #include <QRadioButton>
+#include <QSettings>
 #include <QSlider>
 #include <QSpinBox>
 #include <QTimer>
@@ -52,16 +54,19 @@ SettingsPanel::SettingsPanel(QWidget* parent) : QWidget(parent) {
     // 下载进度 → 实时更新对应行
     connect(downloader_, &ModelDownloader::progressChanged, this,
             [this](int percent, qint64 got, qint64 total) {
+                dlPct_ = percent;
+                dlGot_ = got;
+                dlTotal_ = total;
                 if (currentRow_ < 0 || currentRow_ >= 4) return;
-                Row& row = rows_[currentRow_];
-                row.progress->setValue(percent);
-                row.status->setText(QStringLiteral("下载中… %1% (")
-                    .arg(percent) +
-                    QStringLiteral("%1 / %2)")
-                        .arg(QString::number(got / 1024 / 1024).append(" MB"),
-                             (total > 0 ? QString::number(total / 1024 / 1024)
-                                                  .append(" MB")
-                                        : QStringLiteral("?"))));
+                rows_[currentRow_].progress->setValue(percent);
+                renderDownloadStatus_();
+            });
+    connect(downloader_, &ModelDownloader::speedUpdated, this,
+            [this](qint64 bps) {
+                dlSpeed_ = bps;          // bps<0 = 清除速度显示（重试/完成/取消）
+                if (bps < 0) return;     // 随后 statusChanged 会给出阶段文本
+                if (currentRow_ < 0 || currentRow_ >= 4) return;
+                renderDownloadStatus_();
             });
     connect(downloader_, &ModelDownloader::statusChanged, this,
             [this](const QString& s) {
@@ -70,6 +75,7 @@ SettingsPanel::SettingsPanel(QWidget* parent) : QWidget(parent) {
             });
     connect(downloader_, &ModelDownloader::downloaded, this,
             [this](const QString&) {
+                dlSpeed_ = -1;
                 if (currentRow_ >= 0 && currentRow_ < 4)
                     rows_[currentRow_].progress->setValue(100);
                 currentRow_ = -1;
@@ -77,6 +83,7 @@ SettingsPanel::SettingsPanel(QWidget* parent) : QWidget(parent) {
             });
     connect(downloader_, &ModelDownloader::downloadFailed, this,
             [this](const ModelEntry& e, const QString& err) {
+                dlSpeed_ = -1;
                 downloadFailed_(e.category, err);
                 currentRow_ = -1;
             });
@@ -88,11 +95,32 @@ void SettingsPanel::buildModelTab_() {
     pageLayout->setContentsMargins(12, 12, 12, 12);
 
     auto* tip = new QLabel(QStringLiteral(
-        "选择并下载免费开源小模型，然后“应用切换”到助手。所有文件保存在 models/ 目录下。"),
-        page);
+        "选择并下载免费开源小模型，然后“应用切换”到助手。所有文件保存在：") +
+        QString::fromStdString(models_root()), page);
     tip->setWordWrap(true);
     tip->setStyleSheet(QStringLiteral("color:#9b9b9b;"));
     pageLayout->addWidget(tip);
+
+    // HF 下载源切换：默认 hf-mirror.com（国内直连 huggingface.co 很慢且易断）
+    {
+        auto* srcRow = new QWidget(page);
+        auto* srcLayout = new QHBoxLayout(srcRow);
+        srcLayout->setContentsMargins(0, 0, 0, 0);
+        srcLayout->addWidget(new QLabel(QStringLiteral("HF 下载源："), srcRow));
+        auto* mirrorCombo = new QComboBox(srcRow);
+        mirrorCombo->addItem(QStringLiteral("hf-mirror.com（国内加速）"));
+        mirrorCombo->addItem(QStringLiteral("huggingface.co（官方源）"));
+        const QSettings s(QStringLiteral("VoiceAgent"), QStringLiteral("gui"));
+        mirrorCombo->setCurrentIndex(
+            s.value(QStringLiteral("download/hf_mirror"), true).toBool() ? 0 : 1);
+        connect(mirrorCombo, &QComboBox::currentIndexChanged, this, [](int idx) {
+            QSettings s(QStringLiteral("VoiceAgent"), QStringLiteral("gui"));
+            s.setValue(QStringLiteral("download/hf_mirror"), idx == 0);
+        });
+        srcLayout->addWidget(mirrorCombo);
+        srcLayout->addStretch(1);
+        pageLayout->addWidget(srcRow);
+    }
 
     auto* grid = new QGridLayout;
     grid->setHorizontalSpacing(10);
@@ -464,6 +492,27 @@ void SettingsPanel::refreshInstalledCombos_() {
         int idx = row.installed->findData(prev, kLocalRole);
         if (idx >= 0) row.installed->setCurrentIndex(idx);
     }
+}
+
+// 进度 + 速度统一渲染，避免两个信号交错覆盖
+void SettingsPanel::renderDownloadStatus_() {
+    if (currentRow_ < 0 || currentRow_ >= 4) return;
+    QString text = QStringLiteral("下载中… %1% (%2 / %3)")
+        .arg(dlPct_)
+        .arg(QString::number(dlGot_ / 1024 / 1024) + QStringLiteral(" MB"))
+        .arg(dlTotal_ > 0 ? QString::number(dlTotal_ / 1024 / 1024) +
+                                QStringLiteral(" MB")
+                          : QStringLiteral("?"));
+    if (dlSpeed_ >= 0) {
+        text += QStringLiteral(" · ");
+        if (dlSpeed_ >= 1024 * 1024)
+            text += QStringLiteral("%1 MB/s")
+                        .arg(QString::number(dlSpeed_ / 1048576.0, 'f', 1));
+        else
+            text += QStringLiteral("%1 KB/s")
+                        .arg(QString::number(dlSpeed_ / 1024.0, 'f', 0));
+    }
+    rows_[currentRow_].status->setText(text);
 }
 
 void SettingsPanel::startDownload_(int rowIndex) {

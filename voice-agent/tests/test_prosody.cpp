@@ -24,10 +24,9 @@ static void test_sentence_split() {
     cout << "TEST sentence split..." << endl;
 
     auto s = ProsodyPlanner::split_sentences("我觉得这里有两个问题。第一是延迟，第二是稳定性。");
-    assert(s.size() == 3);
+    assert(s.size() == 2);
     assert(s[0] == "我觉得这里有两个问题。");
-    assert(s[1] == "第一是延迟，");   // 逗号是次级标点，不切
-    assert(s[2] == "第二是稳定性。");
+    assert(s[1] == "第一是延迟，第二是稳定性。");   // 逗号是次级标点，不切
 
     // 连续标点并入同一段
     s = ProsodyPlanner::split_sentences("真的吗？！太好了。");
@@ -42,6 +41,24 @@ static void test_sentence_split() {
     s = ProsodyPlanner::split_sentences("好。。。行吧。");
     assert(s.size() == 2);
     assert(s[0] == "好。。。");
+
+    // UTF-8 安全：呀/怎/一等字的编码字节与"。"重叠，
+    // 按单字节匹配标点会把汉字切碎 —— 必须整字切分
+    s = ProsodyPlanner::split_sentences("你好呀！今天天气怎么样？");
+    assert(s.size() == 2);
+    assert(s[0] == "你好呀！");
+    assert(s[1] == "今天天气怎么样？");
+
+    // 流式 hold_tail：无终止标点的半句不返回（等下一批 token）
+    s = ProsodyPlanner::split_sentences("你好", 120, true);
+    assert(s.empty());
+    s = ProsodyPlanner::split_sentences("你好呀！今天", 120, true);
+    assert(s.size() == 1);
+    assert(s[0] == "你好呀！");
+    // 整段模式：半句作为最后一段返回
+    s = ProsodyPlanner::split_sentences("你好呀！今天", 120, false);
+    assert(s.size() == 2);
+    assert(s[1] == "今天");
 
     // 超长无标点文本：按 max_chars 硬切
     s = ProsodyPlanner::split_sentences(string(300, 'a'), 100);
@@ -322,7 +339,9 @@ static void test_token_stream_to_segments() {
 
     for (const char* tok : tokens) {
         pending += tok;
-        auto sents = ProsodyPlanner::split_sentences(pending);
+        // 与 Orchestrator::feed_speech_text_ 一致：流式 hold_tail，
+        // 无终止标点的半句留在缓冲里等下一批 token
+        auto sents = ProsodyPlanner::split_sentences(pending, 120, true);
         if (sents.empty()) continue;
         size_t consumed = 0;
         for (const auto& s : sents) consumed += s.size();

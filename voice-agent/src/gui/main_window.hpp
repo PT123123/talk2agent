@@ -117,6 +117,11 @@ private:
     // 幂等释放 PTT：窗口失焦/关闭时 key-up 收不到，必须在这里补一次 stop。
     // 无脑可重复调用 —— pttHolding_ 为 false 时直接返回。
     void releasePtt_();
+    // PTT 按住说话的界面提示：对话区遮罩（脉冲红点）+ 输入卡录音态红边。
+    // showPttOverlay_ 在按下空格的一瞬间调用，不等工作线程确认。
+    void showPttOverlay_();
+    void hidePttOverlay_();
+    void setComposerRecording_(bool on);
     // 把状态机英文状态翻成用户能看懂的中文，并按当前上下文补充说明
     // （例如"正在听你说（已打断当前回答）"）。
     QString statusTextFor_(const QString& state) const;
@@ -141,6 +146,13 @@ private:
     bool turnWasInterrupted_ = false;
     // 空格按键是否被按下过（用于失焦时判断要不要补 stop）
     bool pttKeyDownSeen_ = false;
+
+    // PTT 按住提示：对话区遮罩 + 脉冲红点；输入卡容器（录音态红边）
+    QFrame* pttOverlay_ = nullptr;
+    QLabel* pttDot_ = nullptr;
+    QTimer* pttPulseTimer_ = nullptr;
+    bool pttPulseOn_ = false;
+    QFrame* composerFrame_ = nullptr;
 
     AgentController* controller_ = nullptr;
     SettingsPanel* settings_ = nullptr;
@@ -212,6 +224,7 @@ private:
     bool loading_ = false;
 
     QString pendingAssistant_;   // 流式累积中的回答
+    int nextTokenLogLen_ = 256;  // 流式进度日志的下一档长度（每 256 字符打一行）
 };
 
 }  // namespace voice_agent::gui

@@ -1,6 +1,7 @@
 // src/main.cpp
 // GUI 入口：启动 Qt6 Widgets 主窗口（Voice Agent 本地全双工语音助手）
 #include "util/log.hpp"
+#include "util/paths.hpp"
 #include "gui/main_window.hpp"
 #include <QApplication>
 #include <QPalette>
@@ -9,7 +10,9 @@
 #include <crtdbg.h>
 #include <cstdint>
 #include <cstdio>
+#include <filesystem>
 #include <fstream>
+#include <system_error>
 #include <windows.h>
 #include <dbghelp.h>
 
@@ -131,8 +134,19 @@ int main(int argc, char* argv[]) {
     // 捕获未处理异常调用栈到 crash_stack.txt
     SetUnhandledExceptionFilter(top_crash_handler);
 
-    // 初始化日志（核心模块内部使用）
-    init_logger("voice-agent", "info");
+    // 初始化日志（核心模块内部使用）。
+    // 必须落文件：just run 用 Start-Process 分离启动 GUI，控制台输出根本看不到；
+    // 使用中的问题（气泡顺序、打断、转写）全靠这份文件回放定位。
+    const std::string log_dir = voice_agent::logs_root();
+    std::error_code log_ec;
+    std::filesystem::create_directories(log_dir, log_ec);
+    const std::string log_file = log_dir + "/voice-agent.log";
+    init_logger("voice-agent", "info", log_file);
+    LOG_INFO("=== VoiceAgent 启动，日志文件: {} ===", log_file);
+
+    // 模型目录一次性迁移（旧工程 models/ → %LOCALAPPDATA%\VoiceAgent\models），
+    // 必须在加载配置/扫描模型之前完成。
+    voice_agent::migrate_legacy_models();
 
     QApplication app(argc, argv);
     QApplication::setOrganizationName("PT123123");

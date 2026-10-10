@@ -229,6 +229,13 @@ struct TTS::Impl {
             return true;
         }
 
+        // ---- bridge 引擎（qwen3tts / chatterbox）：推理在 Python 进程，----
+        // 本地**不建** sherpa 引擎。走到这里说明 initialize 已探测通过
+        //（Ready/Loading），直接成功返回；否则会拿空路径去建 sherpa 引擎，
+        // 失败后 initialize 报 "failed to load model"，实际 bridge 却是好的。
+        if (tts_bridge_engine_from_string(config.engine) != TtsBridgeEngine::Unknown)
+            return true;
+
 #ifdef USE_SHERPAONNX
         // provider: auto → 运行时支持 DirectML 就用 GPU，否则 CPU
         std::string prov = config.provider;
@@ -624,7 +631,18 @@ std::string TTS::simple_voice_name() const {
     return {};
 }
 
+bool TTS::is_speaking() const {
+    if (simple_engine_ && impl_ && impl_->sapi)
+        return impl_->sapi->is_speaking();
+    return false;
+}
+
 bool TTS::uses_real_backend() const {
+    // bridge 引擎（qwen3tts / chatterbox）：推理在 Python 进程里，
+    // 本进程的 impl_->tts_ 永远是空 —— 按它判断会把活着的 qwen3tts
+    // 报成 Mock。bridge 对象存在即真实后端（未就绪在 provider_label
+    // 里已有"[未就绪]"标注，不在这里重复）。
+    if (bridge_) return true;
     if (simple_engine_) return impl_ && impl_->sapi && impl_->sapi->available();
 #ifdef USE_SHERPAONNX
     return impl_ && impl_->tts_ != nullptr;

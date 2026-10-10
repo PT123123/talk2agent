@@ -85,6 +85,12 @@ public:
     // 是否正在合成
     bool is_synthesizing() const { return synthesizing_; }
 
+    // simple(SAPI) 引擎是否正在实际出声（含队列中待读的段）。
+    // SAPI 的朗读不经过 AudioRouter，状态机需要据此判断"语音还没读完"，
+    // 否则会提前收尾（表现为只读第一句）。其余引擎恒为 false ——
+    // 它们的音频走 AudioRouter，播放回调自己知道缓冲何时放完。
+    bool is_speaking() const;
+
     // 是否使用"简单引擎"（Windows 系统语音 SAPI，免模型、实时流式）
     bool simple_engine() const { return simple_engine_; }
 

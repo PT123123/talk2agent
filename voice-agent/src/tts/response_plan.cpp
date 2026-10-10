@@ -31,6 +31,26 @@ std::optional<SpeechSegment> ResponsePlan::next_to_synthesize() {
     return std::nullopt;
 }
 
+size_t ResponsePlan::claim_next(SpeechSegment& out) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    while (cursor_ < slots_.size()) {
+        auto& s = slots_[cursor_];
+        if (s.state == SegmentState::Discarded) {
+            ++cursor_;
+            continue;
+        }
+        if (s.state == SegmentState::Pending) {
+            out = s.seg;
+            s.state = SegmentState::Synthesized;   // 锁内立即占用
+            playing_idx_ = static_cast<long long>(cursor_);
+            return cursor_;
+        }
+        // 当前段已占用（合成/播放中）：等 mark_played 推进游标
+        return npos;
+    }
+    return npos;
+}
+
 void ResponsePlan::mark_synthesized(size_t index) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (index >= slots_.size()) return;

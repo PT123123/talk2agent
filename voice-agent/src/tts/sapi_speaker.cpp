@@ -239,7 +239,12 @@ void SapiSpeaker::set_rate(float speed) {
 }
 
 bool SapiSpeaker::is_speaking() const {
-    return impl_->speaking.load();
+    // speaking 只在"正在朗读某一段"时为 true；段与段之间有短暂空窗
+    //（上一段刚播完、下一段还没出队）。只看它的话，状态机会在空窗里
+    // 误判"读完了"提前收尾 —— 队列非空也要算还在说话。
+    if (impl_->speaking.load()) return true;
+    std::lock_guard<std::mutex> lk(impl_->qmtx);
+    return !impl_->queue.empty();
 }
 
 void SapiSpeaker::set_done_callback(std::function<void()> cb) {

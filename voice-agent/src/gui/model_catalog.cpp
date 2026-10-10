@@ -1,5 +1,6 @@
 // src/gui/model_catalog.cpp
 #include "gui/model_catalog.hpp"
+#include "util/paths.hpp"
 
 #include <QDir>
 #include <QFileInfo>
@@ -317,7 +318,7 @@ qint64 dirTotalBytes(const QString& dir) {
 
 std::vector<LocalModel> scanLocalModels() {
     std::vector<LocalModel> out;
-    const QString root = QStringLiteral("models");
+    const QString root = QString::fromStdString(models_root());
     QDir baseDir(root);
     if (!baseDir.exists()) return out;
 

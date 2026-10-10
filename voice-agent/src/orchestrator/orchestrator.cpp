@@ -279,6 +279,15 @@ void Orchestrator::start() {
                     // 推到 Interrupting → Listening，此时再 enter_idle_()
                     // 会把用户正在说话的轮次直接踢回 Idle（表现为mic 停了）。
                     const bool natural_end = (state_.load() == State::Speaking);
+                    // simple(SAPI) 引擎的朗读不经过 AudioRouter（合成回调
+                    // 只有 is_last、0 帧），缓冲天然是空的。它还在出声时
+                    // 绝不能收尾：状态机先于语音结束的话，token 喂入门控
+                    //（Thinking|Speaking）会把后续句子全部挡掉 —— 表现为
+                    // 只读第一句。这里保持播放模式、输出静音等它读完。
+                    if (natural_end && tts_ && tts_->is_speaking()) {
+                        std::memset(data, 0, frames * sizeof(int16_t));
+                        return;
+                    }
                     audio_router_.stop_playback();
                     std::memset(data, 0, frames * sizeof(int16_t));
                     if (natural_end) enter_idle_();
@@ -526,6 +535,8 @@ void Orchestrator::submit_segment_(std::vector<int16_t> seg) {
             turn_busy_ = false;
             return;
         }
+        LOG_INFO("[Orch] 语音轮提交用户文本 len={} turn={}（先回显再进入 LLM）",
+                 text.size(), current_turn_id_.load());
         if (user_text_cb_ && !text.empty()) user_text_cb_(text);
         if (text.empty()) {
             enter_idle_();
@@ -766,7 +777,11 @@ void Orchestrator::enter_thinking_(const std::string& text) {
         auto rres = remote_->chat(
             creq,
             [this](const std::string& tok) {
-                if (state_.load() == State::Thinking) {
+                // 与本地路径同款状态门（见 on_llm_token_ 内注释）：
+                // 只认 Thinking 会在首段音频切到 Speaking 后丢掉
+                // 后续所有 token —— 远程路径连文字展示都会断流。
+                const State st = state_.load();
+                if (st == State::Thinking || st == State::Speaking) {
                     on_llm_token_(LLMResponse{tok, false, 0});
                 }
             },
@@ -889,6 +904,8 @@ void Orchestrator::submit_user_text(std::string text) {
         std::lock_guard<std::mutex> lock(text_mutex_);
         accumulated_text_.clear();
     }
+    LOG_INFO("[Orch] PTT 轮提交用户文本 len={} turn={}", text.size(),
+             current_turn_id_.load());
     if (user_text_cb_) user_text_cb_(text);
 
     if (!admit_user_turn_(text)) {
@@ -1008,6 +1025,7 @@ TaskId Orchestrator::spawn_background_for_decision_(const ResponseDecision& deci
 
 void Orchestrator::speak_ack_(const std::string& text) {
     if (text.empty()) return;
+    LOG_INFO("[Orch] 抢答 ack '{}'", text);
     // 抢答是"先垫一句"，不进对话历史、不进 LLM 上下文 —— 只是让用户
     // 知道系统接住了。真正的回答还在后面。
     if (tts_ && tts_enabled_.load()) {
@@ -1218,6 +1236,8 @@ void Orchestrator::on_llm_token_(const LLMResponse& chunk) {
         // R8：首 token 到达（TTFT 观测点）
         if (turn_first_token_ns_ == 0) {
             turn_first_token_ns_ = now_ns();
+            LOG_INFO("[Orch] LLM 首 token len={} turn={}", chunk.text.size(),
+                     current_turn_id_.load());
             if (turn_llm_start_ns_ > 0) {
                 const double ttft = static_cast<double>(turn_first_token_ns_ -
                                                          turn_llm_start_ns_) / 1e6;
@@ -1236,8 +1256,19 @@ void Orchestrator::on_llm_token_(const LLMResponse& chunk) {
         // 再经 ITtsAdapter 落到具体引擎。
         // 仍然坚持"句级"而非逐 token 直灌 —— SAPI 一次 Speak 会清空当前读本，
         // 逐字喂会互相打断只读几字。
-        if (tts_ && tts_enabled_.load() && state_.load() == State::Thinking) {
-            feed_speech_text_(chunk.text);
+        //
+        // 状态门必须是 Thinking|Speaking，不能只认 Thinking：
+        // 首段音频一到 on_tts_chunk_ 就 enter_speaking_() 切到 Speaking，
+        // 而 LLM 此时往往还在继续出 token —— 只认 Thinking 的话，
+        // 第一个标点之后的内容全部进不了 TTS（表现为"只读第一句"）。
+        // Interrupting/Listening 不喂：打断路径已清空缓冲，迟到的
+        // token 不该复活成下一句的残肢。
+        {
+            const State st = state_.load();
+            if (tts_ && tts_enabled_.load() &&
+                (st == State::Thinking || st == State::Speaking)) {
+                feed_speech_text_(chunk.text);
+            }
         }
 
         // LLM 结束
@@ -1353,12 +1384,16 @@ void Orchestrator::feed_speech_text_(const std::string& token) {
     // 这里管的是"还没到句子边界的半句"。
     speech_buffer_pending_ += token;
 
-    // 切出所有完整句
-    auto sents = ProsodyPlanner::split_sentences(speech_buffer_pending_);
+    // 切出所有完整句。hold_tail=true：无终止标点的半句留在缓冲里等
+    // 下一批 token 拼完整 —— 不 hold 的话每个 token 的尾巴都会被当成
+    // "整句"立刻送去合成，一句话被拆成碎片，且首段极短、音频来得
+    // 极快，会立刻把状态机切到 Speaking。
+    auto sents = ProsodyPlanner::split_sentences(speech_buffer_pending_, 120,
+                                                 /*hold_tail=*/true);
     if (sents.empty()) return;
 
-    // split_sentences 会丢掉不含内容的段，剩余部分留着等下一批 token
-    // 用"已消费的字符数"反推还剩多少，比逐句 erase 更快也更不容易出错。
+    // 返回的各段即"已消费"部分（含被丢弃的纯标点段之外的完整句），
+    // 半句尾巴留在缓冲里等下一批 token
     size_t consumed = 0;
     for (const auto& s : sents) consumed += s.size();
     speech_buffer_pending_.erase(0, consumed);
@@ -1420,22 +1455,24 @@ void Orchestrator::flush_speech_tail_() {
 bool Orchestrator::pump_next_segment_() {
     if (!tts_ || !tts_adapter_) return false;
 
-    auto seg = response_plan_.next_to_synthesize();
-    if (!seg.has_value()) return false;
+    // claim_next 在锁内原子完成"取段+占用"。pump 会从 LLM 线程
+    // （feed）和 TTS 回调线程（is_last 连播）并发进来，不原子的话
+    // 两边会拿到同一段，重复合成出重叠音频。
+    SpeechSegment seg;
+    const size_t idx = response_plan_.claim_next(seg);
+    if (idx == ResponsePlan::npos) return false;
 
-    const size_t idx = synth_cursor_.load();
-    response_plan_.mark_synthesized(idx);
-    response_plan_.mark_playing(idx);
+    synth_cursor_.store(idx);   // on_tts_chunk_ 的 is_last 按它 mark_played
 
     tts_->set_cancel_token(session_token_);
     const double t0 = now_ms();
     tts_adapter_->synthesize(
-        *seg, [this](const int16_t* audio, size_t frames, bool is_last) {
+        seg, [this](const int16_t* audio, size_t frames, bool is_last) {
             on_tts_chunk_(audio, frames, is_last);
         });
     tts_accum_ms_.store(tts_accum_ms_.load() + (now_ms() - t0));
     LOG_DEBUG("Synthesized segment #{} ({} chars, {}ms est): {}",
-              idx, seg->text.size(), seg->estimated_ms, seg->text);
+              idx, seg.text.size(), seg.estimated_ms, seg.text);
     return true;
 }
 

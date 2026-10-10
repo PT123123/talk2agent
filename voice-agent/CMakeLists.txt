@@ -227,6 +227,7 @@ set(CORE_SOURCES
     src/util/latency_metrics.cpp
     src/util/gpu.cpp
     src/util/mem_probe.cpp
+    src/util/paths.cpp
     src/audio/audio_device.cpp
     src/audio/audio_pipeline.cpp
     src/audio/echo_cancellation.cpp

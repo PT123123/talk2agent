@@ -37,11 +37,19 @@ class ResponsePlan {
 public:
     ResponsePlan() = default;
 
+    static constexpr size_t npos{static_cast<size_t>(-1)};
+
     // 追加一批段（来自 LLM 的新输出）
     void append(const std::vector<SpeechSegment>& segs);
 
-    // 取出下一个该合成的段（自动跳过已丢弃的）
+    // 取出下一个该合成的段（自动跳过已丢弃的；只读，不占用）
     std::optional<SpeechSegment> next_to_synthesize();
+
+    // 原子地取出并占用下一段：锁内完成"跳过已丢弃 → 命中 Pending →
+    // 标记为已合成"。pump 会从 LLM 线程（feed）和 TTS 回调线程（连播）
+    // 并发触发，不原子的话两边会拿到同一段、重复合成出重叠音频。
+    // 返回段下标；无可取段返回 npos。
+    size_t claim_next(SpeechSegment& out);
 
     // 标记某段已合成（按段 id，段 id 即 append 时的下标）
     void mark_synthesized(size_t index);

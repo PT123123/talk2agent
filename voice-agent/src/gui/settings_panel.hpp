@@ -83,12 +83,21 @@ private:
     void downloadFailed_(ModelCategory cat, const QString& error);
     int activeRowForCategory_(ModelCategory cat) const;
 
+    // 用缓存的进度+速度渲染当前下载行状态文本
+    void renderDownloadStatus_();
+
     std::array<Row, 4> rows_;
     ModelDownloader* downloader_ = nullptr;
     LatencyPanel* latency_ = nullptr;
     QTabWidget* innerTabs_ = nullptr;
     int currentRow_ = -1;   // 正在下载的行索引
     QLabel* activeSummary_ = nullptr;
+
+    // 下载进度/速度缓存（progressChanged 与 speedUpdated 交错到达时统一渲染）
+    qint64 dlSpeed_ = -1;   // 字节/秒；<0 = 不显示
+    int dlPct_ = 0;
+    qint64 dlGot_ = 0;
+    qint64 dlTotal_ = 0;
 
     // 麦克风调试子页
     QComboBox* micCombo_ = nullptr;

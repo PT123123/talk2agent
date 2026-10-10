@@ -267,12 +267,27 @@ class TTSBackend:
         voice = (req.get("voice") or "").strip()
         if instruction:
             kwargs["instruct"] = instruction
-        if voice:
-            kwargs["speaker"] = voice
+        if not voice:
+            # speaker 是 generate_custom_voice 的必填参数：voice 为空时
+            # 取模型支持的第一个预置音色兜底，而不是让请求直接 500。
+            try:
+                supported = self._model.get_supported_speakers() or []
+            except Exception:
+                supported = []
+            voice = supported[0] if supported else "Vivian"
+        kwargs["speaker"] = voice
 
-        lang = (req.get("lang") or "zh").strip()
+        lang = (req.get("lang") or "").strip()
+        # qwen_tts 只接受语言全名（"chinese"…）或 "auto"，不接受 ISO 代码：
+        # C++ 侧发的是 "zh"/"en" 这类代码，这里做映射，未知值原样传让后端报错。
+        lang_map = {
+            "zh": "chinese", "en": "english", "fr": "french", "de": "german",
+            "it": "italian", "ja": "japanese", "ko": "korean",
+            "pt": "portuguese", "ru": "russian", "es": "spanish",
+        }
+        language = lang_map.get(lang.lower(), lang) if lang else "auto"
         try:
-            wav = self._model.generate_custom_voice(text, language=lang, **kwargs)
+            wav = self._model.generate_custom_voice(text, language=language, **kwargs)
         except TypeError:
             # 某些版本签名不含 language / speaker，逐级退化而不是直接失败
             wav = self._model.generate_custom_voice(text, **kwargs)

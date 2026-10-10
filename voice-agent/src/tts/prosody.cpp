@@ -4,6 +4,8 @@
 #include <algorithm>
 #include <cmath>
 #include <cctype>
+#include <cstring>
+#include <utility>
 
 namespace voice_agent {
 
@@ -64,77 +66,139 @@ Prosody prosody_for_emotion(const std::string& emotion, Prosody base) {
 }
 
 // ========== 句级切分 ==========
+namespace {
+
+// 解析 s[pos] 起的一个 UTF-8 码点，cp 输出码点值。
+// 返回消耗的字节数；返回 0 表示输入在码点中间被截断（流式累积缓冲的
+// 常态：token 可能把一个汉字劈成两半）—— 调用方应停止扫描，把剩余
+// 字节留在缓冲里等下一批数据补全。非法字节按 1 字节消耗、cp=0xFFFD。
+size_t utf8_next(const std::string& s, size_t pos, char32_t& cp) {
+    const unsigned char c = static_cast<unsigned char>(s[pos]);
+    if (c < 0x80) { cp = static_cast<char32_t>(c); return 1; }
+    size_t need; char32_t acc;
+    if ((c & 0xE0) == 0xC0)      { need = 2; acc = c & 0x1Fu; }
+    else if ((c & 0xF0) == 0xE0) { need = 3; acc = c & 0x0Fu; }
+    else if ((c & 0xF8) == 0xF0) { need = 4; acc = c & 0x07u; }
+    else { cp = 0xFFFD; return 1; }
+    if (pos + need > s.size()) return 0;   // 截断：等更多数据
+    for (size_t k = 1; k < need; ++k) {
+        const unsigned char cc = static_cast<unsigned char>(s[pos + k]);
+        if ((cc & 0xC0) != 0x80) { cp = 0xFFFD; return 1; }
+        acc = (acc << 6) | (cc & 0x3Fu);
+    }
+    cp = acc;
+    return need;
+}
+
+// 标点匹配必须比较完整 UTF-8 序列，绝不能按单字节找 ——
+// "呀"(E5 91 80)、"怎"(E6 80 8E)、"一"(E4 B8 80) 的编码字节与
+// "。"(E3 80 82) 重叠，按字节匹配会把汉字切碎。
+bool is_terminal_seq(const std::string& s, size_t pos, size_t len) {
+    static const char* const kSeqs[] = {
+        "。", "！", "？", "；", "…", "!", "?", ";", "\n",
+    };
+    for (const char* p : kSeqs) {
+        if (std::strlen(p) == len && s.compare(pos, len, p) == 0) return true;
+    }
+    return false;
+}
+
+// 次级标点：只在段内过半/超长时作为切分点，平时不切
+bool is_secondary_seq(const std::string& s, size_t pos, size_t len) {
+    static const char* const kSeqs[] = { "，", "、", "：", ",", ":" };
+    for (const char* p : kSeqs) {
+        if (std::strlen(p) == len && s.compare(pos, len, p) == 0) return true;
+    }
+    return false;
+}
+
+// 段内是否含可念的内容（排除空白与标点；尾部截断按有内容处理）
+bool seg_has_speech(const std::string& s) {
+    static const char* const kPunct[] = {
+        "，", "。", "！", "？", "；", "：", "、", "…", "—", "·",
+        "（", "）", "《", "》", "“", "”", "‘", "’",
+        ",", ".", "!", "?", ";", ":",
+        "(", ")", "[", "]", "{", "}", "\"", "'", "-",
+    };
+    size_t i = 0;
+    while (i < s.size()) {
+        char32_t cp;
+        const size_t n = utf8_next(s, i, cp);
+        if (n == 0) return true;    // 尾部截断：等补全，先当有内容
+        bool punct = false;
+        for (const char* p : kPunct) {
+            if (std::strlen(p) == n && s.compare(i, n, p) == 0) { punct = true; break; }
+        }
+        if (!punct) {
+            if (n == 1 && std::isspace(static_cast<unsigned char>(s[i]))) {
+                i += n;
+                continue;
+            }
+            return true;            // 中文/字母/数字等实际内容
+        }
+        i += n;
+    }
+    return false;
+}
+
+}  // namespace
+
 std::vector<std::string> ProsodyPlanner::split_sentences(const std::string& text,
-                                                         int max_chars) {
+                                                         int max_chars,
+                                                         bool hold_tail) {
     std::vector<std::string> out;
     if (text.empty()) return out;
+    const size_t max_cp = max_chars > 0 ? static_cast<size_t>(max_chars) : 120;
 
-    // 主标点（中英）。找到这些位置就是句子边界。
-    static const std::string kTerminal = "。！？；!?;\n";
-    // 次级标点：超过 max_chars 时用它们再切
-    static const std::string kSecondary = "，、：,:";
+    std::string cur;          // 当前句累积（UTF-8）
+    size_t cur_chars = 0;     // 当前句码点数
+    auto flush = [&]() {
+        if (!cur.empty()) out.push_back(std::move(cur));
+        cur.clear();
+        cur_chars = 0;
+    };
 
-    size_t start = 0;
-    while (start < text.size()) {
-        // 找下一个主标点
-        size_t cut = std::string::npos;
-        for (size_t i = start; i < text.size(); ++i) {
-            if (kTerminal.find(text[i]) != std::string::npos) {
-                cut = i;
-                break;
-            }
-        }
+    size_t i = 0;
+    while (i < text.size()) {
+        char32_t cp;
+        const size_t n = utf8_next(text, i, cp);
+        if (n == 0) break;    // 尾部不完整码点：留在缓冲等补全
 
-        if (cut == std::string::npos) {
-            // 没有主标点：整段（或按次级标点切）
-            const size_t len = text.size() - start;
-            if (len <= static_cast<size_t>(max_chars)) {
-                out.push_back(text.substr(start));
-                break;
+        cur.append(text, i, n);
+        ++cur_chars;
+        i += n;
+
+        if (is_terminal_seq(text, i - n, n)) {
+            // 连续终止标点并入同段（"？！"、"。。。"）
+            while (i < text.size()) {
+                char32_t cp2;
+                const size_t n2 = utf8_next(text, i, cp2);
+                if (n2 == 0 || !is_terminal_seq(text, i, n2)) break;
+                cur.append(text, i, n2);
+                i += n2;
             }
-            size_t sec = std::string::npos;
-            for (size_t i = start; i < text.size(); ++i) {
-                if (kSecondary.find(text[i]) != std::string::npos) {
-                    sec = i;
-                    break;
-                }
-            }
-            if (sec == std::string::npos || sec - start < static_cast<size_t>(max_chars) / 2) {
-                out.push_back(text.substr(start, static_cast<size_t>(max_chars)));
-                start += static_cast<size_t>(max_chars);
-            } else {
-                out.push_back(text.substr(start, sec - start + 1));
-                start = sec + 1;
-            }
+            flush();
             continue;
         }
 
-        std::string seg = text.substr(start, cut - start + 1);
-
-        // 连续标点（如 "？！"）应该并入同一段
-        size_t end = cut + 1;
-        while (end < text.size() &&
-               (kTerminal.find(text[end]) != std::string::npos)) {
-            seg += text[end];
-            ++end;
+        // 超长无标点：次级标点过半后可切，到硬上限必须切
+        //（码点边界，绝不切坏 UTF-8）
+        if (cur_chars >= max_cp ||
+            (cur_chars * 2 >= max_cp && is_secondary_seq(text, i - n, n))) {
+            flush();
         }
-        out.push_back(std::move(seg));
-        start = end;
     }
 
-    // 丢弃纯标点/空白的段
-    out.erase(std::remove_if(out.begin(), out.end(), [](const std::string& s) {
-        for (unsigned char c : s) {
-            if (c > 0x7F) return false;                       // 含中文等即认为有内容
-            if (!std::isspace(c) &&
-                std::string("。！？；：、,.!?;:()[]{}《》“”‘’\"'-").find(
-                    static_cast<char>(c)) == std::string::npos) {
-                return false;
-            }
-        }
-        return true;
-    }), out.end());
+    if (!hold_tail && !cur.empty()) {
+        // 整段规划模式：无终止标点的尾巴也作为最后一段返回
+        out.push_back(std::move(cur));
+    }
+    // hold_tail=true：尾巴留在输入缓冲里，feed 只消费返回的字节
 
+    // 丢弃纯标点/空白的段
+    out.erase(std::remove_if(out.begin(), out.end(),
+                             [](const std::string& s) { return !seg_has_speech(s); }),
+              out.end());
     return out;
 }
 

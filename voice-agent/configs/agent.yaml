@@ -16,13 +16,13 @@ vad:
 
 # ===== 打断配置 =====
 barge_in:
-  min_ms: 160                  # 打断门槛：用户开口后需持续这么久才真正打断
+  min_ms: 160
                               # （低于此时长视为咳嗽/咂嘴，Agent 继续说完）
   backchannel_max_ms: 600      # 附和词最大时长
   coherence_max: 0.6          # AEC 相干性阈值
-  fade_out_ms: 40              # 打断时播报淡出时长（避免硬切爆音）
-  duck_volume: 0.35            # 门槛等待期间 Agent 音量比例（0~1）
-  require_threshold: true      # false = 开口即打断（不推荐）
+  fade_out_ms: 40
+  duck_volume: 0.35
+  require_threshold: true
 
 # ===== EOU（End of Utterance）配置 =====
 eou:
@@ -30,10 +30,12 @@ eou:
   force_ms: 900                # 强制判定（兜底）
   max_utterance_ms: 20000      # 最大说话时长
 
-# ===== 模型路径（相对于项目根目录）=====
+# ===== 模型路径 =====
+# 实际存放位置：%LOCALAPPDATA%\VoiceAgent\models（用户目录，随首次启动自动迁移）。
+# 这里保留 "models/..." 相对写法，加载时由 util/paths.cpp 重映射到用户目录。
 vad_model: models/vad/silero_vad.onnx
 asr_model: models/asr/paraformer-zh
-tts_model: models/tts/kokoro-multi-lang-v1_0
+tts_model: models/tts/qwen3tts
 llm_model: models/llm/qwen2.5-1.5b-instruct-q4_k_m.gguf
 
 # ===== 语音输入方式 =====
@@ -98,3 +100,8 @@ zipvoice:
   ref_text: ""
   num_steps: 4                # 4=官方推荐；2 更快但音质下降；6+ 线性变慢不值
   guidance_scale: 1.5
+
+tts_engine: simple
+tts_speed: 1.000000
+tts_pitch: 1.000000
+tts_speaker_id: 45

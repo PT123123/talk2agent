@@ -6,6 +6,7 @@
 #include "util/config.hpp"
 #include "util/log.hpp"
 #include "util/mem_probe.hpp"
+#include "util/paths.hpp"
 #include "orchestrator/orchestrator.hpp"
 #include "agent/tool_registry.hpp"
 #include "agent/agent_loop.hpp"
@@ -19,7 +20,9 @@
 
 #include <QObject>
 #include <QFileInfo>
+#include <QProcess>
 #include <QString>
+#include <QStringList>
 #include <QVariantList>
 #include <algorithm>
 #include <chrono>
@@ -32,6 +35,7 @@
 #include <fstream>
 #include <map>
 #include <system_error>
+#include <thread>
 #include <vector>
 #include <nlohmann/json.hpp>
 
@@ -101,12 +105,21 @@ constexpr int kSwitchStageCount() {
     return static_cast<int>(sizeof(kSwitchStages) / sizeof(kSwitchStages[0]));
 }
 
-// 把 paths 中的空段回退为配置默认值，并拼成 “models/<subdir>/file”
+// 把 paths 中的空段回退为配置默认值，并统一落到用户模型目录
+// （%LOCALAPPDATA%\VoiceAgent\models，见 util/paths.hpp）。
+// sel 是相对模型根的子路径（如 "tts/kokoro-multi-lang-v1_0"）；
+// def 来自配置，加载时已 remap 成绝对路径，这里兜底兼容旧相对写法。
 std::string resolve_model(const QString& sel, const std::string& def,
                           const std::string& prefix) {
-    if (!sel.isEmpty()) return "models/" + sel.toStdString();
-    if (def.rfind("models/", 0) == 0) return def;
-    return prefix + "/" + def;
+    if (!sel.isEmpty())
+        return models_root() + "/" + sel.toLocal8Bit().toStdString();
+    const std::string remapped = remap_model_path(def);
+    if (remapped != def) return remapped;      // 旧 "models/..." 写法已重定向
+    if (def.empty() || remapped.front() == '/' ||
+        (remapped.size() > 1 && remapped[1] == ':'))
+        return remapped;                        // 空 / 绝对路径直接用
+    // 其它相对路径沿用旧语义：归到对应子目录下
+    return models_root() + prefix.substr(6) + "/" + remapped;  // 去掉 "models" 前缀
 }
 
 // 探测 TTS 模型目录类型：
@@ -114,6 +127,8 @@ std::string resolve_model(const QString& sel, const std::string& def,
 //   "piper"（含 espeak-ng-data + onnx）
 //   "zipvoice"（含 encoder.*.onnx + decoder.*.onnx —— 注意它也有 espeak-ng-data，
 //              所以必须**先**判zipvoice，否则会被误认成 piper）
+//   "qwen3tts"（HF 权重目录：config.json + model.safetensors [+ speech_tokenizer/]，
+//              推理走 Python bridge，本地只认目录）
 //   空
 std::string detect_tts_engine(const std::string& dir) {
     if (dir.empty()) return {};
@@ -131,6 +146,13 @@ std::string detect_tts_engine(const std::string& dir) {
         return "zipvoice";
     }
     if (std::filesystem::exists(dir + "/espeak-ng-data", ec)) return "piper";
+    // qwen3tts：config.json + model.safetensors 是 HF 权重的最小特征。
+    // 只判 model.safetensors 不够（chatterbox 等其它 HF 模型也有），
+    // 加上 speech_tokenizer/ 子目录（Qwen3-TTS 特有）才不会误认。
+    const bool hf_tts = std::filesystem::exists(dir + "/config.json", ec) &&
+                        std::filesystem::exists(dir + "/model.safetensors", ec);
+    if (hf_tts && std::filesystem::exists(dir + "/speech_tokenizer", ec))
+        return "qwen3tts";
     return {};
 }
 
@@ -181,12 +203,18 @@ TTSConfig tts_config_for_dir(const std::string& dir, const AppConfig& cfg) {
     // PyTorch 引擎（qwen3tts / chatterbox）：不用 sherpa-onnx 的本地权重，
     // 识别权重目录也没有意义（推理在 Python 进程里）。直接按配置透传，
     // TTS::initialize 会探测 bridge，不可用时自动回退到 SAPI。
-    if (cfg.tts_engine == "qwen3tts" || cfg.tts_engine == "chatterbox") {
-        tc.engine = cfg.tts_engine;
+    // 目录识别优先于配置值：用户在模型管理里选了哪个目录就用哪个引擎，
+    // 否则 yaml 里残留的 tts_engine: simple 会让"选了 qwen3tts"永远不生效。
+    const bool bridge_dir = (eng == "qwen3tts" || eng == "chatterbox");
+    const bool bridge_cfg = (cfg.tts_engine == "qwen3tts" ||
+                             cfg.tts_engine == "chatterbox");
+    if (bridge_dir || (bridge_cfg && eng.empty())) {
+        tc.engine = bridge_dir ? eng : cfg.tts_engine;
+        tc.model_path = dir;   // bridge 启动参数 --model-path 要用权重目录
         // 适配器跟随引擎：显式配了 auto 就用引擎对应的风格适配器，
         // 否则用户只改引擎却拿不到 instruction/exaggeration 会很费解。
         if (tc.prosody_adapter == "auto" || tc.prosody_adapter.empty())
-            tc.prosody_adapter = cfg.tts_engine;
+            tc.prosody_adapter = tc.engine;
         return tc;
     }
 
@@ -227,6 +255,78 @@ TTSConfig tts_config_for_dir(const std::string& dir, const AppConfig& cfg) {
         tc.lexicon = dir + "/lexicon-zh.txt";
     }
     return tc;
+}
+
+// bridge 引擎（qwen3tts/chatterbox）的推理在独立 Python 进程
+//（scripts/tts_bridge_server.py）里跑。GUI 不该要求用户手敲命令行：
+// 探测发现 bridge 没起时，自动用工程内的 .venv 拉起一个**分离**进程，
+// 等它进入 Ready/Loading 再返回（权重可后台加载，不必等加载完）。
+// 找不到 venv/脚本或拉起失败只写日志不抛错 —— TTS::initialize 的
+// 降级链（回退 SAPI）仍然是兜底。
+void ensure_tts_bridge_running(const TTSConfig& tc,
+                               const std::function<void(const QString&)>& log) {
+    if (tc.engine != "qwen3tts" && tc.engine != "chatterbox") return;
+
+    TtsBridgeConfig bc;
+    bc.endpoint = tc.bridge_endpoint;
+    bc.engine = tts_bridge_engine_from_string(tc.engine);
+    bc.health_timeout_ms = tc.bridge_health_timeout_ms;
+
+    // 端口从 endpoint 尾部取（http://127.0.0.1:8770 → 8770）
+    std::string port = "8770";
+    const auto colon = tc.bridge_endpoint.rfind(':');
+    if (colon != std::string::npos && colon > tc.bridge_endpoint.rfind('/'))
+        port = tc.bridge_endpoint.substr(colon + 1);
+
+    std::string detail;
+    {
+        TtsBridge b(bc);
+        const TtsBridgeHealth h = b.probe(&detail);
+        if (h == TtsBridgeHealth::Ready || h == TtsBridgeHealth::Loading) return;
+    }
+
+    // venv 与脚本都在工程根（just run 从工程根启动，相对路径即可命中）
+    const auto exists = [](const std::string& p) {
+        std::error_code e;
+        return std::filesystem::exists(p, e);
+    };
+    const char* kPy = ".venv/Scripts/python.exe";
+    const char* kScript = "scripts/tts_bridge_server.py";
+    if (!exists(kPy) || !exists(kScript)) {
+        log(QStringLiteral(
+                "qwen3tts 需要 Python bridge，但未找到 .venv 或 bridge 脚本。"
+                "请手动执行：.venv\\Scripts\\python.exe scripts\\tts_bridge_server.py "
+                "--engine %1 --model-path \"%2\" --port %3 --device cpu")
+                .arg(to_q(tc.engine), to_q(tc.model_path), to_q(port)));
+        return;
+    }
+
+    QStringList args{to_q(kScript), QStringLiteral("--engine"),
+                     to_q(tc.engine),
+                     QStringLiteral("--model-path"), to_q(tc.model_path),
+                     QStringLiteral("--port"), to_q(port),
+                     QStringLiteral("--device"), QStringLiteral("cpu")};
+    log(QStringLiteral("TTS bridge 未运行，自动拉起：%1 %2")
+            .arg(to_q(kPy), args.join(u' ')));
+    if (!QProcess::startDetached(to_q(kPy), args)) {
+        log(QStringLiteral("TTS bridge 进程拉起失败，%1 将回退系统语音。")
+                .arg(to_q(tc.engine)));
+        return;
+    }
+    // Python 启动 + 端口监听需要几秒；Ready/Loading 都算成功
+    //（Loading = 端口已开、权重后台加载，首句合成时再等）。
+    for (int waited = 400; waited <= 10000; waited += 400) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(400));
+        TtsBridge b(bc);
+        const TtsBridgeHealth h = b.probe(&detail);
+        if (h == TtsBridgeHealth::Ready || h == TtsBridgeHealth::Loading) {
+            log(QStringLiteral("TTS bridge 已就绪（等待 %1 ms）。").arg(waited));
+            return;
+        }
+    }
+    log(QStringLiteral("等待 TTS bridge 就绪超时（10s，%1）。"
+                      "首句合成会再等待，或回退系统语音。")
+            .arg(to_q(detail.empty() ? std::string("无详细原因") : detail)));
 }
 
 // 采样一次私有内存，返回"相对 before 增加了多少"。
@@ -487,6 +587,14 @@ void AgentController::initCore_() {
     } catch (...) {
         emit logLine("configs/agent.yaml 未找到，使用默认配置。");
     }
+    // 模型路径统一重映射到用户目录（旧 "models/..." 相对写法 → 绝对路径），
+    // 覆盖四个主模型 + ZipVoice 的 vocoder / 参考音频（这两项直接透传给 TTS）。
+    impl->cfg.vad_model = remap_model_path(impl->cfg.vad_model);
+    impl->cfg.asr_model = remap_model_path(impl->cfg.asr_model);
+    impl->cfg.tts_model = remap_model_path(impl->cfg.tts_model);
+    impl->cfg.llm_model = remap_model_path(impl->cfg.llm_model);
+    impl->cfg.tts_zipvoice_vocoder = remap_model_path(impl->cfg.tts_zipvoice_vocoder);
+    impl->cfg.tts_ref_audio = remap_model_path(impl->cfg.tts_ref_audio);
 
     // 搜索路由：本地 SearXNG 优先，在线 Provider 桩
     ++step;
@@ -675,6 +783,7 @@ void AgentController::initModelsWork_(Impl* impl) {
         emit loadStageChanged(8, 9, kInitStages[7]);   // "加载 TTS 模型"
         TTSConfig tc = tts_config_for_dir(impl->cfg.tts_model, impl->cfg);
         if (tc.engine.empty()) tc.engine = impl->cfg.tts_engine;
+        ensure_tts_bridge_running(tc, [this](const QString& s) { emit logLine(s); });
 auto t0 = std::chrono::steady_clock::now();
         markModelLoading_("TTS", impl->cfg.tts_model);
         const std::uint64_t before = mem_probe().private_bytes;
@@ -769,6 +878,7 @@ void AgentController::applyModelsWork_(Impl* impl, const ModelPaths& paths) {
         emit loadStageChanged(++step, total, kSwitchStages[step - 1]);
         TTSConfig tc = tts_config_for_dir(ttsPath, impl->cfg);
         if (tc.engine.empty()) tc.engine = impl->cfg.tts_engine;
+        ensure_tts_bridge_running(tc, [this](const QString& s) { emit logLine(s); });
 auto t0 = std::chrono::steady_clock::now();
         markModelLoading_("TTS", ttsPath);
         const std::uint64_t before = mem_probe().private_bytes;
@@ -898,6 +1008,7 @@ void AgentController::handleListMemory_() {
 void AgentController::emitText_(const std::string& text) {
     if (!impl_) return;
     impl_->lastResponse = text;   // 供"语音播报"按钮朗读
+    LOG_INFO("[Ctrl] llmComplete len={}（对话区收尾）", text.size());
     emit llmComplete(to_q(text));
 }
 
@@ -1250,11 +1361,12 @@ void AgentController::persistConfig_() {
                 changed = true;
             }
         };
+        // 写回配置用相对写法（unmap），配置文件不落机器相关绝对路径
         std::map<std::string, std::string> keys = {
-            {"vad_model", impl_->cfg.vad_model},
-            {"asr_model", impl_->cfg.asr_model},
-            {"tts_model", impl_->cfg.tts_model},
-            {"llm_model", impl_->cfg.llm_model},
+            {"vad_model", unmap_model_path(impl_->cfg.vad_model)},
+            {"asr_model", unmap_model_path(impl_->cfg.asr_model)},
+            {"tts_model", unmap_model_path(impl_->cfg.tts_model)},
+            {"llm_model", unmap_model_path(impl_->cfg.llm_model)},
             {"tts_engine", impl_->cfg.tts_engine},
         };
         for (auto& [key, val] : keys) set_scalar(key, val);
@@ -1382,7 +1494,10 @@ std::shared_ptr<Orchestrator> AgentController::buildOrchestrator_(
     });
     // ASR 转写完成的整句文本 → 回显到对话区（fromVoice=true）
     orch->set_user_text_callback([this](const std::string& text) {
-        if (!text.empty()) emit userMessage(to_q(text), true);
+        if (!text.empty()) {
+            LOG_INFO("[Ctrl] 语音轮用户文本 len={}（→ userMessage 信号）", text.size());
+            emit userMessage(to_q(text), true);
+        }
     });
     orch->set_trace_callback([this](const std::string& stage, double ms) {
         onStage_(stage, ms);
@@ -1421,6 +1536,8 @@ void AgentController::handleText_(const QString& text) {
     if (!impl_) return;
     const std::string t = text.trimmed().toStdString();
     if (t.empty()) return;
+    LOG_INFO("[Ctrl] 文本轮 len={}（memory 命令={}）", t.size(),
+             impl_->memory && is_memory_command(t));
 
     // /memory 命令：直接执行，不走 LLM
     if (impl_->memory && is_memory_command(t)) {

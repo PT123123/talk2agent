@@ -67,9 +67,15 @@ public:
 
     explicit ProsodyPlanner(Config cfg = {}) : cfg_(cfg) {}
 
-    // 把一段文本切成若干 SpeechSegment（只切分，不加韵律）
+    // 把一段文本切成若干句子（只切分，不加韵律）。
+    // hold_tail=true（流式场景）：末尾没有终止标点的半句不返回，
+    // 留在调用方的累积缓冲里等下一批 token；"返回各段的字节长度之和"
+    // 即本次已消费的字节数。false（整段一次性规划）：半句也作为最后一段返回。
+    // 切分按 UTF-8 码点进行 —— 按单字节匹配标点会把"呀/怎/一"等
+    // 编码字节与标点重叠的汉字切碎。
     static std::vector<std::string> split_sentences(const std::string& text,
-                                                    int max_chars = 120);
+                                                    int max_chars = 120,
+                                                    bool hold_tail = false);
 
     // 为单个句子生成 SpeechSegment。
     // emotion 为空表示中性；intensity 0~1 表示情绪强度。
